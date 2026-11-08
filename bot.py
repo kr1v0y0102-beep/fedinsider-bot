@@ -23,7 +23,10 @@ log = logging.getLogger("federal-insider")
 TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+# Одна модель или цепочка через запятую: если первая перегружена (503), бот пробует следующую.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash,gemini-3.5-flash,gemini-3.1-flash-lite").strip()
+GEMINI_MODELS = [m.strip() for m in GEMINI_MODEL.split(",") if m.strip()]
+LAST_GOOD_MODEL: str | None = None
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/federal_inside").strip()
 
 # Способ обращения к Gemini: auto (сначала interactions, потом запасной generate),
@@ -33,8 +36,8 @@ GEMINI_API_MODE = os.getenv("GEMINI_API_MODE", "auto").strip().lower()
 THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low").strip().lower()
 if THINKING_LEVEL in ("", "off", "none"):
     THINKING_LEVEL = None
-GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "75"))
-GEMINI_RETRIES = int(os.getenv("GEMINI_RETRIES", "2"))  # повторы только при 429/500/503
+GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "50"))
+GEMINI_RETRIES = int(os.getenv("GEMINI_RETRIES", "1"))  # попыток на одну модель/режим
 
 
 def parse_admin_ids(raw: str) -> set[int]:
@@ -355,11 +358,11 @@ async def _post_json(url: str, headers: dict, payload: dict, timeout: int):
     return code, data
 
 
-async def _call_interactions(prompt: str, use_system: bool, timeout: int) -> str:
+async def _call_interactions(prompt: str, use_system: bool, timeout: int, model: str) -> str:
     url = "https://generativelanguage.googleapis.com/v1beta/interactions"
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json",
                "Api-Revision": "2026-05-20"}
-    payload = {"model": GEMINI_MODEL,
+    payload = {"model": model,
                "input": (f"{SYSTEM_PROMPT}\n\n" if use_system else "") + prompt}
     if THINKING_LEVEL:
         payload["generation_config"] = {"thinking_level": THINKING_LEVEL}
@@ -391,8 +394,8 @@ async def _call_interactions(prompt: str, use_system: bool, timeout: int) -> str
     return text
 
 
-async def _call_generate(prompt: str, use_system: bool, timeout: int) -> str:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+async def _call_generate(prompt: str, use_system: bool, timeout: int, model: str) -> str:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
     payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
     if use_system:
@@ -412,7 +415,15 @@ async def _call_generate(prompt: str, use_system: bool, timeout: int) -> str:
     return text
 
 
+def _model_order() -> list[str]:
+    """Сначала последняя успешная модель, затем остальные по порядку из GEMINI_MODEL."""
+    if LAST_GOOD_MODEL in GEMINI_MODELS:
+        return [LAST_GOOD_MODEL] + [m for m in GEMINI_MODELS if m != LAST_GOOD_MODEL]
+    return list(GEMINI_MODELS)
+
+
 async def generate_gemini_text(prompt_text: str) -> str:
+    global LAST_GOOD_MODEL
     if not GEMINI_API_KEY:
         raise Exception("Не задана переменная окружения GEMINI_API_KEY")
 
@@ -425,31 +436,40 @@ async def generate_gemini_text(prompt_text: str) -> str:
         modes = [("interactions", _call_interactions), ("generate", _call_generate)]
 
     errors = []
-    for name, fn in modes:
-        for attempt in range(GEMINI_RETRIES):
-            t0 = time.monotonic()
-            try:
-                text = await fn(prompt, True, GEMINI_TIMEOUT)
-                log.info("Gemini (%s) ответил за %.1f сек.", name, time.monotonic() - t0)
-                return finalize_post(text)
-            except asyncio.TimeoutError:
-                msg = f"{name}: нет ответа за {GEMINI_TIMEOUT} сек."
-                log.warning(msg)
-                errors.append(msg)
-                break  # зависший режим не повторяем, переходим к запасному
-            except aiohttp.ClientError as e:
-                msg = f"{name}: сетевая ошибка {e}"
-                log.warning(msg)
-                errors.append(msg)
+    for model in _model_order():
+        skip_model = False  # модель перегружена или молчит: идём к следующей
+        for mode_name, fn in modes:
+            if skip_model:
                 break
-            except GeminiError as e:
-                log.warning("Gemini: %s", e)
-                if e.retry and attempt + 1 < GEMINI_RETRIES:
-                    await asyncio.sleep(3 * (attempt + 1))
-                    continue
-                errors.append(str(e))
-                break
-    raise Exception(" | ".join(errors) or "Не удалось получить ответ от Gemini")
+            for attempt in range(GEMINI_RETRIES):
+                t0 = time.monotonic()
+                try:
+                    text = await fn(prompt, True, GEMINI_TIMEOUT, model)
+                    LAST_GOOD_MODEL = model
+                    log.info("Gemini %s/%s ответил за %.1f сек.", model, mode_name, time.monotonic() - t0)
+                    return finalize_post(text)
+                except asyncio.TimeoutError:
+                    msg = f"{model}/{mode_name}: нет ответа за {GEMINI_TIMEOUT} сек."
+                    log.warning(msg)
+                    errors.append(msg)
+                    skip_model = True
+                    break
+                except aiohttp.ClientError as e:
+                    msg = f"{model}/{mode_name}: сетевая ошибка {e}"
+                    log.warning(msg)
+                    errors.append(msg)
+                    skip_model = True
+                    break
+                except GeminiError as e:
+                    log.warning("Gemini %s: %s", model, e)
+                    if e.retry and attempt + 1 < GEMINI_RETRIES:
+                        await asyncio.sleep(3 * (attempt + 1))
+                        continue
+                    errors.append(f"{model}/{mode_name}: {str(e)[:160]}")
+                    if e.retry:
+                        skip_model = True
+                    break
+    raise Exception((" | ".join(errors[-4:]))[:700] or "Не удалось получить ответ от Gemini")
 
 
 # ======================= ОТПРАВКА ПОСТА =======================
@@ -602,8 +622,11 @@ async def packs_cmd(message: types.Message):
 
 @dp.message(Command("testgemini"))
 async def testgemini_cmd(message: types.Message):
-    lines = [f"Модель: <code>{html.escape(GEMINI_MODEL)}</code>, режим: <code>{GEMINI_API_MODE}</code>, "
-             f"таймаут: {GEMINI_TIMEOUT} сек."]
+    # /testgemini  или  /testgemini gemini-3.5-flash,gemini-3.1-flash-lite
+    parts = (message.text or "").split(maxsplit=1)
+    models = [m.strip() for m in parts[1].split(",") if m.strip()] if len(parts) > 1 else list(GEMINI_MODELS)
+    lines = [f"Цепочка моделей: <code>{html.escape(', '.join(GEMINI_MODELS))}</code>",
+             f"Режим: <code>{GEMINI_API_MODE}</code>, таймаут: {GEMINI_TIMEOUT} сек."]
     msg = await message.answer("🔬 Проверяю связь с Gemini...")
 
     async def show(tail: str = ""):
@@ -613,6 +636,7 @@ async def testgemini_cmd(message: types.Message):
             pass
 
     # 1) Доступность API и список моделей
+    names: list[str] = []
     await show("⏳ Список моделей...")
     t0 = time.monotonic()
     try:
@@ -621,13 +645,11 @@ async def testgemini_cmd(message: types.Message):
                                headers={"x-goog-api-key": GEMINI_API_KEY},
                                timeout=aiohttp.ClientTimeout(total=20)) as resp:
             raw, code = await resp.text(), resp.status
-        dt = time.monotonic() - t0
         if code == 200:
             names = [m.get("name", "").replace("models/", "") for m in json.loads(raw).get("models", [])]
-            gem = [n for n in names if n.startswith("gemini")]
-            mark = "есть" if GEMINI_MODEL in names else "НЕТ в списке"
-            lines.append(f"✅ API доступен ({dt:.1f} c). Модель {mark}.")
-            lines.append("Доступные: " + html.escape(", ".join(gem[:25])))
+            flash = [n for n in names if "flash" in n and not any(x in n for x in ("image", "tts"))]
+            lines.append(f"✅ API доступен ({time.monotonic() - t0:.1f} c).")
+            lines.append("Flash-модели: " + html.escape(", ".join(flash[:30])))
         else:
             lines.append(f"❌ Список моделей: HTTP {code}: {html.escape(raw[:200])}")
     except asyncio.TimeoutError:
@@ -635,34 +657,44 @@ async def testgemini_cmd(message: types.Message):
     except Exception as e:
         lines.append(f"❌ Список моделей: {html.escape(str(e)[:200])}")
 
-    # 2) Короткий запрос через оба режима
+    # 2) Короткий запрос к каждой модели цепочки
     working = []
-    for mode, fn in (("interactions", _call_interactions), ("generate", _call_generate)):
-        await show(f"⏳ Тест {mode}...")
-        t0 = time.monotonic()
-        try:
-            text = await fn("Ответь одним словом: ок", False, 40)
-            lines.append(f"✅ {mode}: {time.monotonic() - t0:.1f} c, ответ: {html.escape(text[:40])}")
-            working.append((mode, fn))
-        except asyncio.TimeoutError:
-            lines.append(f"⏱ {mode}: нет ответа за 40 сек.")
-        except Exception as e:
-            lines.append(f"❌ {mode}: {html.escape(str(e)[:250])}")
+    for model in models:
+        mark = " (нет в списке!)" if names and model not in names else ""
+        for mode, fn in (("interactions", _call_interactions), ("generate", _call_generate)):
+            await show(f"⏳ {model} / {mode}...")
+            t0 = time.monotonic()
+            try:
+                await fn("Ответь одним словом: ок", False, 30, model)
+                lines.append(f"✅ {model}{mark} / {mode}: {time.monotonic() - t0:.1f} c")
+                working.append((model, mode, fn))
+                break
+            except asyncio.TimeoutError:
+                lines.append(f"⏱ {model} / {mode}: нет ответа за 30 сек.")
+                break
+            except GeminiError as e:
+                lines.append(f"❌ {model} / {mode}: {html.escape(str(e)[:160])}")
+                if e.retry:  # перегрузка: второй способ на этой же модели не поможет
+                    break
+            except Exception as e:
+                lines.append(f"❌ {model} / {mode}: {html.escape(str(e)[:160])}")
 
-    # 3) Боевой промпт на коротком примере
+    # 3) Боевой промпт на первой рабочей модели
     if working:
-        mode, fn = working[0]
-        await show(f"⏳ Тест боевого промпта ({mode}), до {GEMINI_TIMEOUT} сек...")
+        model, mode, fn = working[0]
+        await show(f"⏳ Боевой промпт: {model} / {mode}...")
         t0 = time.monotonic()
         try:
             text = await fn("Исходные данные:\nНАБУ задержало чиновника в Киеве за взятку 50 тыс. долларов.",
-                            True, GEMINI_TIMEOUT)
-            lines.append(f"✅ Боевой промпт ({mode}): {time.monotonic() - t0:.1f} c, {len(text)} симв.")
+                            True, GEMINI_TIMEOUT, model)
+            lines.append(f"✅ Боевой промпт ({model}): {time.monotonic() - t0:.1f} c, {len(text)} симв.")
         except asyncio.TimeoutError:
-            lines.append(f"⏱ Боевой промпт ({mode}): нет ответа за {GEMINI_TIMEOUT} сек.")
+            lines.append(f"⏱ Боевой промпт ({model}): нет ответа за {GEMINI_TIMEOUT} сек.")
         except Exception as e:
-            lines.append(f"❌ Боевой промпт ({mode}): {html.escape(str(e)[:250])}")
-    await show("Готово. Пришли этот результат разработчику.")
+            lines.append(f"❌ Боевой промпт ({model}): {html.escape(str(e)[:200])}")
+    else:
+        lines.append("⚠️ Ни одна модель не ответила. Попробуй /testgemini gemini-flash-latest")
+    await show("Готово.")
 
 
 @dp.message(Command("emojiid"))
