@@ -77,29 +77,25 @@ def get_preview_keyboard(has_photo: bool):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def generate_gemini_text(prompt_text: str) -> str:
-    # Использование официального API v1 с актуальной моделью gemini-2.5-flash
-    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    # Используем новое Interactions API и модель gemini-3.8-flash
+    url = f"https://generativelanguage.googleapis.com/v1beta/interactions?key={GEMINI_API_KEY}"
     payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": f"{SYSTEM_PROMPT}\n\nИсходные данные:\n{prompt_text}"}
-                ]
-            }
-        ]
+        "model": "models/gemini-3.8-flash",
+        "input": f"{SYSTEM_PROMPT}\n\nИсходные данные:\n{prompt_text}"
     }
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=payload) as resp:
             data = await resp.json()
             if resp.status != 200:
-                # Пробуем резервный эндпоинт v1beta с gemini-2.5-flash если v1 вернет ошибку
-                fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-                async with session.post(fallback_url, json=payload) as fb_resp:
-                    fb_data = await fb_resp.json()
-                    if fb_resp.status != 200:
-                        raise Exception(f"API Error {fb_resp.status}: {fb_data}")
-                    return fb_data["candidates"][0]["content"]["parts"][0]["text"]
-            return data["candidates"][0]["content"]["parts"][0]["text"]
+                raise Exception(f"API Error {resp.status}: {data}")
+            
+            # Парсинг ответа Interactions API
+            if "output" in data:
+                return data["output"]
+            elif "candidates" in data:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            else:
+                return str(data)
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
