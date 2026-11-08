@@ -2,9 +2,11 @@ import os
 import re
 import json
 import html
+import time
 import asyncio
 import logging
 import aiohttp
+from collections import Counter
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -23,12 +25,16 @@ GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/federal_inside").strip()
-# low / minimal ускоряют ответ. Пустое значение или "off" отключает параметр.
+
+# Способ обращения к Gemini: auto (сначала interactions, потом запасной generate),
+# interactions или generate.
+GEMINI_API_MODE = os.getenv("GEMINI_API_MODE", "auto").strip().lower()
+# low / minimal ускоряют ответ в режиме interactions. Пусто или "off" отключает параметр.
 THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low").strip().lower()
 if THINKING_LEVEL in ("", "off", "none"):
     THINKING_LEVEL = None
-GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "60"))
-GEMINI_RETRIES = int(os.getenv("GEMINI_RETRIES", "2"))
+GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "75"))
+GEMINI_RETRIES = int(os.getenv("GEMINI_RETRIES", "2"))  # повторы только при 429/500/503
 
 
 def parse_admin_ids(raw: str) -> set[int]:
@@ -43,14 +49,30 @@ def parse_admin_ids(raw: str) -> set[int]:
 # Через запятую или пробел: "123456789, 987654321". Пусто = бот закрыт для всех.
 ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 
-# Премиум-эмодзи канала: {"обычный эмодзи": "custom_emoji_id"}.
-# Свои ID добавляются через переменную PREMIUM_EMOJI_JSON, например:
-# {"📍":"5368...","💰":"5369...","⚖️":"5370..."}
-PREMIUM_EMOJI: dict[str, str] = {"📌": "5368324170671202286"}
+# Наборы премиум-эмодзи (по приоритету: при совпадении эмодзи берётся из первого набора).
+PREMIUM_PACKS = [p.strip() for p in os.getenv(
+    "PREMIUM_PACKS",
+    "federal_insider_by_emojicreationbot,AdaptiveStatus,tgmacicons",
+).split(",") if p.strip()]
+MAX_PREMIUM_PER_POST = int(os.getenv("MAX_PREMIUM_PER_POST", "14"))
+MAX_PER_EMOJI = int(os.getenv("MAX_PER_EMOJI", "3"))
+
+
+def norm_emoji(e: str) -> str:
+    return e.replace("\ufe0f", "")
+
+
+# Ручные ID (необязательно), например: {"📍":"5368...","💰":"5369..."}
+MANUAL_PREMIUM: dict[str, str] = {}
 try:
-    PREMIUM_EMOJI.update({k: str(v) for k, v in json.loads(os.getenv("PREMIUM_EMOJI_JSON", "{}") or "{}").items()})
+    MANUAL_PREMIUM = {norm_emoji(k): str(v)
+                      for k, v in json.loads(os.getenv("PREMIUM_EMOJI_JSON", "{}") or "{}").items()}
 except Exception as e:
     log.warning("PREMIUM_EMOJI_JSON не разобран: %s", e)
+
+DEFAULT_PREMIUM = {"📌": "5368324170671202286"}
+# Итоговый словарь «эмодзи без FE0F -> custom_emoji_id». Заполняется при старте из наборов.
+PREMIUM_EMOJI: dict[str, str] = {**DEFAULT_PREMIUM, **MANUAL_PREMIUM}
 
 CAPTION_LIMIT = 1024
 MESSAGE_LIMIT = 4096
@@ -76,16 +98,8 @@ class PostState(StatesGroup):
 
 # ======================= SYSTEM PROMPT =======================
 
-def emoji_tag(emoji: str) -> str:
-    """Тег премиум-эмодзи, если ID известен, иначе обычный эмодзи."""
-    eid = PREMIUM_EMOJI.get(emoji)
-    return f'<tg-emoji emoji-id="{eid}">{emoji}</tg-emoji>' if eid else emoji
-
-
 def build_system_prompt() -> str:
-    emoji_list = "\n".join(
-        f'  * {e} → <tg-emoji emoji-id="{i}">{e}</tg-emoji>' for e, i in PREMIUM_EMOJI.items()
-    )
+    avail = " ".join(list(PREMIUM_EMOJI.keys())[:150])
     return f"""
 Ты — главный редактор и автор Telegram-канала «Federal Insider». 
 Твоя задача — переписывать входящую фактуру, материалы сливов и новости в фирменный пост канала.
@@ -112,7 +126,7 @@ def build_system_prompt() -> str:
   * Легавые, погоны, силовики, пацюки, дельцы, гусаки, фигуранты
   * Сверхсуровая баланда, нары, СИЗО, деда Лука, райдел
 
-АРХИТЕКТУРА ПОСТА (выдавать строго в HTML-разметке Telegram; допустимы только теги <b>, <i>, <u>, <a href="...">, <code>, <blockquote>, <tg-emoji>):
+АРХИТЕКТУРА ПОСТА (выдавать строго в HTML-разметке Telegram; допустимы только теги <b>, <i>, <u>, <a href="...">, <code>, <blockquote>):
 - Заголовок: [📌/🆔/FAKE/НАБУ/СХЕМА/ДБР] КАПСОВЫЙ ЗАГОЛОВОК С СУТЬЮ И СУММОЙ $
 - Вторая строка: 📍 Локация | 💰 Ущерб / Сумма
 - Вводный абзац: Завязка (кто, где и как умножил на ноль схему).
@@ -125,17 +139,15 @@ def build_system_prompt() -> str:
 - Панчлайн: Фирменный вывод про баланду, нары и СИЗО.
 - Подпись внизу: <a href="{CHANNEL_LINK}">Federal Insider | Подписаться</a>
 
-ПРЕМИУМ-ЭМОДЗИ TELEGRAM:
-- В заголовке и важных блоках (локация, ущерб, правовая квалификация) используй кастомные премиум-эмодзи через тег <tg-emoji emoji-id="ID">эмодзи</tg-emoji>.
-- Внутри тега ВСЕГДА стоит обычный эмодзи-заменитель.
-- Используй ТОЛЬКО эмодзи и ID из этого списка, другие ID выдумывать запрещено:
-{emoji_list}
-- Эмодзи, которых нет в списке, пиши обычными символами без тега.
-- Примеры оформления:
-  Заголовок: {emoji_tag("📌")} <b>НАБУ: ДЕПУТАТ «НАРЕЗАЛ КУШ» НА 5 МЛН $</b>
-  Локация: {emoji_tag("📍")} Киев | {emoji_tag("💰")} <b>Ущерб: 5 000 000 $</b>
-  Правовая рамка: {emoji_tag("⚖️")} <b>Официальная квалификация:</b>
-- Не больше одного премиум-эмодзи на строку и не больше 6 на весь пост.
+ЭМОДЗИ (у канала есть фирменные премиум-иконки):
+- Пиши эмодзи обычными символами, БЕЗ каких-либо тегов. Бот сам заменит их на премиум-версии.
+- Эмодзи с премиум-версией: {avail}
+- Выбирай эмодзи строго по смыслу строки и темы поста (деньги, оружие, обыск, суд, локация, документы, транспорт и т.д.). Предпочитай эмодзи из списка выше.
+- Не больше одного эмодзи на строку, на весь пост не больше 8, один и тот же эмодзи не чаще двух раз.
+- Примеры:
+  Заголовок: 📌 <b>НАБУ: ДЕПУТАТ «НАРЕЗАЛ КУШ» НА 5 МЛН $</b>
+  Локация: 📍 Киев | 💰 <b>Ущерб: 5 000 000 $</b>
+  Правовая рамка: ⚖️ <b>Официальная квалификация:</b>
 
 Весь пост должен уместиться примерно в 3500 символов.
 Выдавай ТОЛЬКО готовый текст поста без вступлений, приветствий, пояснений и без markdown-обёрток (никаких ``` и **).
@@ -190,6 +202,17 @@ TAG_NAME_RE = re.compile(r"^<\s*/?\s*([a-zA-Z][a-zA-Z0-9-]*)")
 TG_EMOJI_RE = re.compile(r'<tg-emoji\s+emoji-id="(\d+)"\s*>(.*?)</tg-emoji>', re.S)
 BARE_AMP_RE = re.compile(r"&(?!(?:amp|lt|gt|quot|#\d+|#x[0-9a-fA-F]+);)")
 
+# Один эмодзи: флаг, кейкап, либо символ + вариации/оттенок/ZWJ-последовательности
+EMOJI_RE = re.compile(
+    r"(?:[\U0001F1E6-\U0001F1FF]{2}"
+    r"|[0-9#*]\ufe0f?\u20e3"
+    r"|(?:[\U0001F000-\U0001FAFF\u2190-\u21FF\u2300-\u23FF\u24C2\u25A0-\u25FF"
+    r"\u2600-\u27BF\u2900-\u297F\u2B00-\u2BFF\u3030\u303D\u3297\u3299"
+    r"\u00A9\u00AE\u203C\u2049\u2122\u2139]"
+    r"[\ufe0f\U0001F3FB-\U0001F3FF]?"
+    r"(?:\u200d[\U0001F000-\U0001FAFF\u2600-\u27BF\u2640\u2642\u2B00-\u2BFF]\ufe0f?)*))"
+)
+
 
 def clean_model_output(text: str) -> str:
     text = text.strip()
@@ -215,10 +238,27 @@ def sanitize_html(text: str) -> str:
     return "".join(out)
 
 
-def fix_premium_emoji(text: str) -> str:
-    """Убирает выдуманные ID и оборачивает известные эмодзи в <tg-emoji>."""
-    known_ids = set(PREMIUM_EMOJI.values())
-    text = TG_EMOJI_RE.sub(lambda m: m.group(0) if m.group(1) in known_ids else m.group(2), text)
+def apply_premium(text: str) -> str:
+    """
+    Заменяет обычные эмодзи в тексте на премиум (<tg-emoji>), если для них есть ID
+    в наборах канала. Выдуманные моделью ID убираются. Есть лимиты на пост и на один эмодзи.
+    """
+    known = set(PREMIUM_EMOJI.values())
+    text = TG_EMOJI_RE.sub(lambda m: m.group(0) if m.group(1) in known else m.group(2), text)
+
+    used: Counter = Counter()
+    total = len(TG_EMOJI_RE.findall(text))
+
+    def repl(m):
+        nonlocal total
+        em = m.group(0)
+        key = norm_emoji(em)
+        eid = PREMIUM_EMOJI.get(key)
+        if not eid or total >= MAX_PREMIUM_PER_POST or used[key] >= MAX_PER_EMOJI:
+            return em
+        total += 1
+        used[key] += 1
+        return f'<tg-emoji emoji-id="{eid}">{em}</tg-emoji>'
 
     parts = re.split(r"(<tg-emoji.*?</tg-emoji>)", text, flags=re.S)
     for idx, part in enumerate(parts):
@@ -228,17 +268,13 @@ def fix_premium_emoji(text: str) -> str:
         for j, seg in enumerate(sub):
             if seg.startswith("<") and seg.endswith(">"):
                 continue
-            for emoji, eid in PREMIUM_EMOJI.items():
-                base = emoji.replace("\ufe0f", "")
-                seg = re.sub(re.escape(base) + "\ufe0f?",
-                             f'<tg-emoji emoji-id="{eid}">{emoji}</tg-emoji>', seg)
-            sub[j] = seg
+            sub[j] = EMOJI_RE.sub(repl, seg)
         parts[idx] = "".join(sub)
     return "".join(parts)
 
 
 def finalize_post(text: str) -> str:
-    return fix_premium_emoji(sanitize_html(clean_model_output(text)))
+    return apply_premium(sanitize_html(clean_model_output(text)))
 
 
 def strip_tags(text: str) -> str:
@@ -257,7 +293,47 @@ def cut_to_limit(text: str, limit: int = MESSAGE_LIMIT) -> str:
     return cut[:pos] if pos > limit // 2 else cut
 
 
-# ======================= GEMINI (Interactions API) =======================
+async def load_premium_packs() -> str:
+    """Загружает наборы кастомных эмодзи и строит словарь «эмодзи -> ID». Возвращает отчёт."""
+    global SYSTEM_PROMPT
+    from_packs: dict[str, str] = {}
+    report = []
+    for name in PREMIUM_PACKS:
+        try:
+            ss = await asyncio.wait_for(bot.get_sticker_set(name), timeout=25)
+        except Exception as e:
+            report.append(f"❌ {name}: {e}")
+            continue
+        total = new = 0
+        for st in ss.stickers:
+            if not getattr(st, "custom_emoji_id", None):
+                continue
+            total += 1
+            for em in EMOJI_RE.findall(st.emoji or ""):
+                key = norm_emoji(em)
+                if key not in from_packs:  # приоритет у более раннего набора
+                    from_packs[key] = st.custom_emoji_id
+                    new += 1
+        report.append(f"✅ {name}: {total} эмодзи, уникальных значков: {new}")
+
+    PREMIUM_EMOJI.clear()
+    PREMIUM_EMOJI.update(DEFAULT_PREMIUM)
+    PREMIUM_EMOJI.update(from_packs)
+    PREMIUM_EMOJI.update(MANUAL_PREMIUM)
+    SYSTEM_PROMPT = build_system_prompt()
+    report.append(f"Всего значков для замены: {len(PREMIUM_EMOJI)}")
+    for line in report:
+        log.info(line)
+    return "\n".join(report)
+
+
+# ======================= GEMINI =======================
+
+class GeminiError(Exception):
+    def __init__(self, msg: str, retry: bool = False):
+        super().__init__(msg)
+        self.retry = retry
+
 
 async def get_session() -> aiohttp.ClientSession:
     global _http_session
@@ -266,76 +342,114 @@ async def get_session() -> aiohttp.ClientSession:
     return _http_session
 
 
+async def _post_json(url: str, headers: dict, payload: dict, timeout: int):
+    session = await get_session()
+    async with session.post(url, json=payload, headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+        raw = await resp.text()
+        code = resp.status
+    try:
+        data = json.loads(raw)
+    except Exception:
+        data = {"raw": raw[:500]}
+    return code, data
+
+
+async def _call_interactions(prompt: str, use_system: bool, timeout: int) -> str:
+    url = "https://generativelanguage.googleapis.com/v1beta/interactions"
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json",
+               "Api-Revision": "2026-05-20"}
+    payload = {"model": GEMINI_MODEL,
+               "input": (f"{SYSTEM_PROMPT}\n\n" if use_system else "") + prompt}
+    if THINKING_LEVEL:
+        payload["generation_config"] = {"thinking_level": THINKING_LEVEL}
+
+    for _ in range(2):
+        code, data = await _post_json(url, headers, payload, timeout)
+        if code == 400 and "generation_config" in payload and \
+                any(w in str(data).lower() for w in ("generation_config", "thinking")):
+            log.warning("interactions: параметр thinking не принят, повторяю без него: %s", data)
+            payload.pop("generation_config", None)
+            continue
+        break
+
+    if code != 200:
+        raise GeminiError(f"interactions HTTP {code}: {str(data)[:300]}",
+                          retry=code in (429, 500, 503))
+    status = data.get("status")
+    if status and status != "completed":
+        raise GeminiError(f"interactions status={status}: {data.get('error') or data.get('errors')}")
+    texts = []
+    for step in data.get("steps") or []:
+        if step.get("type") == "model_output":
+            for block in step.get("content") or []:
+                if block.get("type") == "text":
+                    texts.append(block.get("text", ""))
+    text = "".join(texts).strip()
+    if not text:
+        raise GeminiError("interactions: пустой ответ")
+    return text
+
+
+async def _call_generate(prompt: str, use_system: bool, timeout: int) -> str:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
+    if use_system:
+        payload["systemInstruction"] = {"parts": [{"text": SYSTEM_PROMPT}]}
+
+    code, data = await _post_json(url, headers, payload, timeout)
+    if code != 200:
+        raise GeminiError(f"generate HTTP {code}: {str(data)[:300]}", retry=code in (429, 500, 503))
+    candidates = data.get("candidates") or []
+    if not candidates:
+        reason = (data.get("promptFeedback") or {}).get("blockReason", "неизвестно")
+        raise GeminiError(f"generate: нет ответа (блокировка: {reason})")
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+    if not text:
+        raise GeminiError(f"generate: пустой ответ (finishReason: {candidates[0].get('finishReason')})")
+    return text
+
+
 async def generate_gemini_text(prompt_text: str) -> str:
     if not GEMINI_API_KEY:
         raise Exception("Не задана переменная окружения GEMINI_API_KEY")
 
-    url = "https://generativelanguage.googleapis.com/v1beta/interactions"
-    headers = {
-        "x-goog-api-key": GEMINI_API_KEY,
-        "Content-Type": "application/json",
-        "Api-Revision": "2026-05-20",
-    }
-    payload = {
-        "model": GEMINI_MODEL,
-        "input": f"{SYSTEM_PROMPT}\n\nИсходные данные:\n{prompt_text[:MAX_INPUT_CHARS]}",
-    }
-    if THINKING_LEVEL:
-        payload["generation_config"] = {"thinking_level": THINKING_LEVEL}
+    prompt = f"Исходные данные:\n{prompt_text[:MAX_INPUT_CHARS]}"
+    if GEMINI_API_MODE == "interactions":
+        modes = [("interactions", _call_interactions)]
+    elif GEMINI_API_MODE == "generate":
+        modes = [("generate", _call_generate)]
+    else:
+        modes = [("interactions", _call_interactions), ("generate", _call_generate)]
 
-    session = await get_session()
-    last_error = None
-    attempt = 0
-    while attempt < GEMINI_RETRIES:
-        attempt += 1
-        try:
-            async with session.post(url, json=payload, headers=headers,
-                                    timeout=aiohttp.ClientTimeout(total=GEMINI_TIMEOUT)) as resp:
-                data = await resp.json(content_type=None)
-                code = resp.status
-        except asyncio.TimeoutError:
-            last_error = f"Gemini не ответил за {GEMINI_TIMEOUT} сек."
-            log.warning(last_error)
-            continue
-        except aiohttp.ClientError as e:
-            last_error = f"Сетевая ошибка: {e}"
-            log.warning(last_error)
-            await asyncio.sleep(2)
-            continue
-
-        if code in (429, 500, 503):
-            last_error = f"API Error {code}: {data}"
-            log.warning(last_error)
-            await asyncio.sleep(3 * attempt)
-            continue
-
-        if code == 400 and "generation_config" in payload and \
-                any(w in str(data).lower() for w in ("generation_config", "thinking")):
-            log.warning("API не принял generation_config, повторяю без него: %s", data)
-            payload.pop("generation_config", None)
-            attempt -= 1  # такой повтор не считается попыткой
-            continue
-
-        if code != 200:
-            raise Exception(f"API Error {code}: {data}")
-
-        status = data.get("status")
-        if status and status != "completed":
-            raise Exception(f"Генерация не завершена (status: {status}): "
-                            f"{data.get('error') or data.get('errors')}")
-
-        texts = []
-        for step in data.get("steps") or []:
-            if step.get("type") == "model_output":
-                for block in step.get("content") or []:
-                    if block.get("type") == "text":
-                        texts.append(block.get("text", ""))
-        text = "".join(texts).strip()
-        if not text:
-            raise Exception("Пустой ответ от Gemini. Нажми «Перегенерировать».")
-        return finalize_post(text)
-
-    raise Exception(last_error or "Не удалось получить ответ от Gemini")
+    errors = []
+    for name, fn in modes:
+        for attempt in range(GEMINI_RETRIES):
+            t0 = time.monotonic()
+            try:
+                text = await fn(prompt, True, GEMINI_TIMEOUT)
+                log.info("Gemini (%s) ответил за %.1f сек.", name, time.monotonic() - t0)
+                return finalize_post(text)
+            except asyncio.TimeoutError:
+                msg = f"{name}: нет ответа за {GEMINI_TIMEOUT} сек."
+                log.warning(msg)
+                errors.append(msg)
+                break  # зависший режим не повторяем, переходим к запасному
+            except aiohttp.ClientError as e:
+                msg = f"{name}: сетевая ошибка {e}"
+                log.warning(msg)
+                errors.append(msg)
+                break
+            except GeminiError as e:
+                log.warning("Gemini: %s", e)
+                if e.retry and attempt + 1 < GEMINI_RETRIES:
+                    await asyncio.sleep(3 * (attempt + 1))
+                    continue
+                errors.append(str(e))
+                break
+    raise Exception(" | ".join(errors) or "Не удалось получить ответ от Gemini")
 
 
 # ======================= ОТПРАВКА ПОСТА =======================
@@ -472,9 +586,83 @@ async def start_cmd(message: types.Message, state: FSMContext):
     await message.answer(
         "👋 Привет! Закидывай фактуру: текст, ссылку, фото с описанием или просто "
         "<b>перешли пост</b> из любого канала, и я упакую его под стиль <b>Federal Insider</b>.\n\n"
+        "/testgemini — проверить связь с Gemini\n"
+        "/packs — перезагрузить наборы премиум-эмодзи\n"
         "/emojiid — узнать ID премиум-эмодзи",
         parse_mode="HTML",
     )
+
+
+@dp.message(Command("packs"))
+async def packs_cmd(message: types.Message):
+    msg = await message.answer("🔄 Загружаю наборы эмодзи...")
+    report = await load_premium_packs()
+    await msg.edit_text(html.escape(report))
+
+
+@dp.message(Command("testgemini"))
+async def testgemini_cmd(message: types.Message):
+    lines = [f"Модель: <code>{html.escape(GEMINI_MODEL)}</code>, режим: <code>{GEMINI_API_MODE}</code>, "
+             f"таймаут: {GEMINI_TIMEOUT} сек."]
+    msg = await message.answer("🔬 Проверяю связь с Gemini...")
+
+    async def show(tail: str = ""):
+        try:
+            await msg.edit_text("\n".join(lines) + (f"\n\n{tail}" if tail else ""), parse_mode="HTML")
+        except Exception:
+            pass
+
+    # 1) Доступность API и список моделей
+    await show("⏳ Список моделей...")
+    t0 = time.monotonic()
+    try:
+        session = await get_session()
+        async with session.get("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+                               headers={"x-goog-api-key": GEMINI_API_KEY},
+                               timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            raw, code = await resp.text(), resp.status
+        dt = time.monotonic() - t0
+        if code == 200:
+            names = [m.get("name", "").replace("models/", "") for m in json.loads(raw).get("models", [])]
+            gem = [n for n in names if n.startswith("gemini")]
+            mark = "есть" if GEMINI_MODEL in names else "НЕТ в списке"
+            lines.append(f"✅ API доступен ({dt:.1f} c). Модель {mark}.")
+            lines.append("Доступные: " + html.escape(", ".join(gem[:25])))
+        else:
+            lines.append(f"❌ Список моделей: HTTP {code}: {html.escape(raw[:200])}")
+    except asyncio.TimeoutError:
+        lines.append("⏱ Список моделей: нет ответа за 20 сек. (сеть до Google или ключ)")
+    except Exception as e:
+        lines.append(f"❌ Список моделей: {html.escape(str(e)[:200])}")
+
+    # 2) Короткий запрос через оба режима
+    working = []
+    for mode, fn in (("interactions", _call_interactions), ("generate", _call_generate)):
+        await show(f"⏳ Тест {mode}...")
+        t0 = time.monotonic()
+        try:
+            text = await fn("Ответь одним словом: ок", False, 40)
+            lines.append(f"✅ {mode}: {time.monotonic() - t0:.1f} c, ответ: {html.escape(text[:40])}")
+            working.append((mode, fn))
+        except asyncio.TimeoutError:
+            lines.append(f"⏱ {mode}: нет ответа за 40 сек.")
+        except Exception as e:
+            lines.append(f"❌ {mode}: {html.escape(str(e)[:250])}")
+
+    # 3) Боевой промпт на коротком примере
+    if working:
+        mode, fn = working[0]
+        await show(f"⏳ Тест боевого промпта ({mode}), до {GEMINI_TIMEOUT} сек...")
+        t0 = time.monotonic()
+        try:
+            text = await fn("Исходные данные:\nНАБУ задержало чиновника в Киеве за взятку 50 тыс. долларов.",
+                            True, GEMINI_TIMEOUT)
+            lines.append(f"✅ Боевой промпт ({mode}): {time.monotonic() - t0:.1f} c, {len(text)} симв.")
+        except asyncio.TimeoutError:
+            lines.append(f"⏱ Боевой промпт ({mode}): нет ответа за {GEMINI_TIMEOUT} сек.")
+        except Exception as e:
+            lines.append(f"❌ Боевой промпт ({mode}): {html.escape(str(e)[:250])}")
+    await show("Готово. Пришли этот результат разработчику.")
 
 
 @dp.message(Command("emojiid"))
@@ -496,7 +684,7 @@ async def emojiid_receive(message: types.Message, state: FSMContext):
             lines.append(f"{sym} → <code>{e.custom_emoji_id}</code>")
     await state.set_state(PostState.waiting_for_input)
     if lines:
-        await message.answer("\n".join(lines) + "\n\nДобавь их в переменную PREMIUM_EMOJI_JSON.",
+        await message.answer("\n".join(lines) + "\n\nМожно добавить в PREMIUM_EMOJI_JSON.",
                              parse_mode="HTML")
     else:
         await message.answer("Премиум-эмодзи в сообщении не найдено.")
@@ -635,10 +823,10 @@ async def main():
     await site.start()
     log.info("Веб-сервер запущен на порту %s", os.getenv("PORT", 10000))
 
-    log.info("Настройки: модель=%s, thinking=%s, админов=%d, GEMINI_API_KEY=%s, CHANNEL_ID=%s",
-             GEMINI_MODEL, THINKING_LEVEL, len(ADMIN_IDS),
-             "есть" if GEMINI_API_KEY else "НЕ ЗАДАН",
-             CHANNEL_ID or "НЕ ЗАДАН")
+    log.info("Настройки: модель=%s, режим=%s, thinking=%s, таймаут=%s, админов=%d, "
+             "GEMINI_API_KEY=%s, CHANNEL_ID=%s",
+             GEMINI_MODEL, GEMINI_API_MODE, THINKING_LEVEL, GEMINI_TIMEOUT, len(ADMIN_IDS),
+             "есть" if GEMINI_API_KEY else "НЕ ЗАДАН", CHANNEL_ID or "НЕ ЗАДАН")
     if not ADMIN_IDS:
         log.warning("ADMIN_IDS пуст: бот закрыт для всех. Свой ID можно узнать командой /id")
 
@@ -648,6 +836,11 @@ async def main():
     except Exception as e:
         log.error("Не удалось авторизоваться в Telegram, проверь TELEGRAM_BOT_TOKEN: %s", e)
         await asyncio.Event().wait()  # не падаем, чтобы ошибка осталась в логах
+
+    try:
+        await load_premium_packs()
+    except Exception as e:
+        log.warning("Наборы эмодзи не загружены: %s", e)
 
     keep_task = asyncio.create_task(keep_alive())
     try:
