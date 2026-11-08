@@ -3,16 +3,19 @@ import re
 import json
 import html
 import time
+import uuid
 import asyncio
 import logging
 import aiohttp
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (InlineKeyboardMarkup, InlineKeyboardButton,
+                           InputMediaPhoto, InputMediaVideo, LinkPreviewOptions)
 from aiohttp import web
 
 logging.basicConfig(level=logging.INFO)
@@ -29,15 +32,34 @@ GEMINI_MODELS = [m.strip() for m in GEMINI_MODEL.split(",") if m.strip()]
 LAST_GOOD_MODEL: str | None = None
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/federal_inside").strip()
 
-# Способ обращения к Gemini: auto (сначала interactions, потом запасной generate),
-# interactions или generate.
 GEMINI_API_MODE = os.getenv("GEMINI_API_MODE", "auto").strip().lower()
-# low / minimal ускоряют ответ в режиме interactions. Пусто или "off" отключает параметр.
 THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low").strip().lower()
 if THINKING_LEVEL in ("", "off", "none"):
     THINKING_LEVEL = None
 GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "50"))
-GEMINI_RETRIES = int(os.getenv("GEMINI_RETRIES", "1"))  # попыток на одну модель/режим
+GEMINI_RETRIES = int(os.getenv("GEMINI_RETRIES", "1"))
+
+# Часовой пояс для отложенных постов и файл очереди.
+TZ_NAME = os.getenv("TIMEZONE", "Europe/Kyiv").strip()
+SCHEDULE_FILE = os.getenv("SCHEDULE_FILE", "scheduled_posts.json").strip()
+
+
+def load_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        for name in (TZ_NAME, "Europe/Kiev"):
+            try:
+                return ZoneInfo(name)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    log.warning("Не удалось загрузить часовой пояс %s (нет tzdata?). Использую UTC+2 без перехода на летнее время.",
+                TZ_NAME)
+    return timezone(timedelta(hours=2))
+
+
+TZ = load_tz()
 
 
 def parse_admin_ids(raw: str) -> set[int]:
@@ -49,23 +71,22 @@ def parse_admin_ids(raw: str) -> set[int]:
     return ids
 
 
-# Через запятую или пробел: "123456789, 987654321". Пусто = бот закрыт для всех.
 ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 
-# Наборы премиум-эмодзи (по приоритету: при совпадении эмодзи берётся из первого набора).
 PREMIUM_PACKS = [p.strip() for p in os.getenv(
     "PREMIUM_PACKS",
     "federal_insider_by_emojicreationbot,AdaptiveStatus,tgmacicons",
 ).split(",") if p.strip()]
 MAX_PREMIUM_PER_POST = int(os.getenv("MAX_PREMIUM_PER_POST", "14"))
 MAX_PER_EMOJI = int(os.getenv("MAX_PER_EMOJI", "3"))
+# Эмодзи, которые НЕ нужно заменять на премиум (например "📍"), если иконка из набора не подходит.
+PREMIUM_EXCLUDE_RAW = os.getenv("PREMIUM_EXCLUDE", "")
 
 
 def norm_emoji(e: str) -> str:
     return e.replace("\ufe0f", "")
 
 
-# Ручные ID (необязательно), например: {"📍":"5368...","💰":"5369..."}
 MANUAL_PREMIUM: dict[str, str] = {}
 try:
     MANUAL_PREMIUM = {norm_emoji(k): str(v)
@@ -74,13 +95,16 @@ except Exception as e:
     log.warning("PREMIUM_EMOJI_JSON не разобран: %s", e)
 
 DEFAULT_PREMIUM = {"📌": "5368324170671202286"}
-# Итоговый словарь «эмодзи без FE0F -> custom_emoji_id». Заполняется при старте из наборов.
 PREMIUM_EMOJI: dict[str, str] = {**DEFAULT_PREMIUM, **MANUAL_PREMIUM}
 
-CAPTION_LIMIT = 1024
+CAPTION_LIMIT = 1024          # жёсткий лимит подписи к медиа у Telegram
+CAPTION_TARGET = 850          # во столько символов просим уложиться Gemini, когда есть медиа
 MESSAGE_LIMIT = 4096
 MEDIA_GROUP_WAIT = 1.5
 MAX_INPUT_CHARS = 12000
+MAX_MEDIA = 10
+
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)  # убирает карточку канала под ссылкой
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения TELEGRAM_BOT_TOKEN")
@@ -89,13 +113,14 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
 _http_session: aiohttp.ClientSession | None = None
-media_buffers: dict[tuple, dict] = {}
+media_buffers: dict[tuple, list] = {}
 
 
 class PostState(StatesGroup):
     waiting_for_input = State()
     waiting_for_photo = State()
     waiting_for_emoji = State()
+    waiting_for_time = State()
     preview = State()
 
 
@@ -159,6 +184,12 @@ def build_system_prompt() -> str:
 
 SYSTEM_PROMPT = build_system_prompt()
 
+MEDIA_NOTE = f"""
+
+ВАЖНО (приоритет выше лимита 3500 из инструкции): к посту прикреплены фото/видео, а у Telegram жёсткий лимит подписи к медиа. 
+ВЕСЬ пост целиком (заголовок, локация, текст, квалификация, панчлайн, подпись) должен быть НЕ ДЛИННЕЕ {CAPTION_TARGET} видимых символов. 
+Сожми: завязка 1–2 предложения, схема 2–3 предложения, без длинных цитат и пошаговых описаний. Структуру и фирменный стиль сохрани."""
+
 
 # ======================= MIDDLEWARE: ЛОГИ И ДОСТУП =======================
 
@@ -171,7 +202,6 @@ async def log_updates(handler, event, data):
 
 async def admin_only(handler, event, data):
     user = getattr(event, "from_user", None)
-    # /id доступна всем, чтобы можно было узнать свой Telegram ID
     if isinstance(event, types.Message) and (event.text or "").split("@")[0].strip() == "/id":
         return await handler(event, data)
     if user is None or user.id not in ADMIN_IDS:
@@ -184,7 +214,6 @@ async def admin_only(handler, event, data):
     return await handler(event, data)
 
 
-# log_updates регистрируется первым, чтобы видеть и отклонённые сообщения
 dp.message.outer_middleware(log_updates)
 dp.callback_query.outer_middleware(log_updates)
 dp.message.outer_middleware(admin_only)
@@ -205,7 +234,6 @@ TAG_NAME_RE = re.compile(r"^<\s*/?\s*([a-zA-Z][a-zA-Z0-9-]*)")
 TG_EMOJI_RE = re.compile(r'<tg-emoji\s+emoji-id="(\d+)"\s*>(.*?)</tg-emoji>', re.S)
 BARE_AMP_RE = re.compile(r"&(?!(?:amp|lt|gt|quot|#\d+|#x[0-9a-fA-F]+);)")
 
-# Один эмодзи: флаг, кейкап, либо символ + вариации/оттенок/ZWJ-последовательности
 EMOJI_RE = re.compile(
     r"(?:[\U0001F1E6-\U0001F1FF]{2}"
     r"|[0-9#*]\ufe0f?\u20e3"
@@ -226,7 +254,6 @@ def clean_model_output(text: str) -> str:
 
 
 def sanitize_html(text: str) -> str:
-    """Оставляет только теги, которые принимает Telegram, и экранирует лишние < > &."""
     out = []
     for token in TAG_RE.split(text):
         if not token:
@@ -242,10 +269,6 @@ def sanitize_html(text: str) -> str:
 
 
 def apply_premium(text: str) -> str:
-    """
-    Заменяет обычные эмодзи в тексте на премиум (<tg-emoji>), если для них есть ID
-    в наборах канала. Выдуманные моделью ID убираются. Есть лимиты на пост и на один эмодзи.
-    """
     known = set(PREMIUM_EMOJI.values())
     text = TG_EMOJI_RE.sub(lambda m: m.group(0) if m.group(1) in known else m.group(2), text)
 
@@ -288,6 +311,15 @@ def drop_custom_emoji(text: str) -> str:
     return TG_EMOJI_RE.sub(r"\2", text)
 
 
+def tg_len(s: str) -> int:
+    """Длина в UTF-16 единицах, как считает Telegram (эмодзи = 2)."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def visible_len(text: str) -> int:
+    return tg_len(html.unescape(strip_tags(text)))
+
+
 def cut_to_limit(text: str, limit: int = MESSAGE_LIMIT) -> str:
     if len(text) <= limit:
         return text
@@ -297,7 +329,6 @@ def cut_to_limit(text: str, limit: int = MESSAGE_LIMIT) -> str:
 
 
 async def load_premium_packs() -> str:
-    """Загружает наборы кастомных эмодзи и строит словарь «эмодзи -> ID». Возвращает отчёт."""
     global SYSTEM_PROMPT
     from_packs: dict[str, str] = {}
     report = []
@@ -314,7 +345,7 @@ async def load_premium_packs() -> str:
             total += 1
             for em in EMOJI_RE.findall(st.emoji or ""):
                 key = norm_emoji(em)
-                if key not in from_packs:  # приоритет у более раннего набора
+                if key not in from_packs:
                     from_packs[key] = st.custom_emoji_id
                     new += 1
         report.append(f"✅ {name}: {total} эмодзи, уникальных значков: {new}")
@@ -323,6 +354,10 @@ async def load_premium_packs() -> str:
     PREMIUM_EMOJI.update(DEFAULT_PREMIUM)
     PREMIUM_EMOJI.update(from_packs)
     PREMIUM_EMOJI.update(MANUAL_PREMIUM)
+    for em in EMOJI_RE.findall(PREMIUM_EXCLUDE_RAW):
+        key = norm_emoji(em)
+        if key not in MANUAL_PREMIUM:
+            PREMIUM_EMOJI.pop(key, None)
     SYSTEM_PROMPT = build_system_prompt()
     report.append(f"Всего значков для замены: {len(PREMIUM_EMOJI)}")
     for line in report:
@@ -416,18 +451,17 @@ async def _call_generate(prompt: str, use_system: bool, timeout: int, model: str
 
 
 def _model_order() -> list[str]:
-    """Сначала последняя успешная модель, затем остальные по порядку из GEMINI_MODEL."""
     if LAST_GOOD_MODEL in GEMINI_MODELS:
         return [LAST_GOOD_MODEL] + [m for m in GEMINI_MODELS if m != LAST_GOOD_MODEL]
     return list(GEMINI_MODELS)
 
 
-async def generate_gemini_text(prompt_text: str) -> str:
+async def generate_gemini_text(prompt: str) -> str:
+    """Принимает уже готовый пользовательский промпт (без системного)."""
     global LAST_GOOD_MODEL
     if not GEMINI_API_KEY:
         raise Exception("Не задана переменная окружения GEMINI_API_KEY")
 
-    prompt = f"Исходные данные:\n{prompt_text[:MAX_INPUT_CHARS]}"
     if GEMINI_API_MODE == "interactions":
         modes = [("interactions", _call_interactions)]
     elif GEMINI_API_MODE == "generate":
@@ -437,7 +471,7 @@ async def generate_gemini_text(prompt_text: str) -> str:
 
     errors = []
     for model in _model_order():
-        skip_model = False  # модель перегружена или молчит: идём к следующей
+        skip_model = False
         for mode_name, fn in modes:
             if skip_model:
                 break
@@ -472,50 +506,138 @@ async def generate_gemini_text(prompt_text: str) -> str:
     raise Exception((" | ".join(errors[-4:]))[:700] or "Не удалось получить ответ от Gemini")
 
 
+async def generate_post(fact: str, has_media: bool) -> str:
+    """Генерация поста. Если есть медиа, просим уложиться в лимит подписи (1024)."""
+    prompt = f"Исходные данные:\n{fact[:MAX_INPUT_CHARS]}"
+    if has_media:
+        prompt += MEDIA_NOTE
+    text = await generate_gemini_text(prompt)
+
+    if has_media and visible_len(text) > CAPTION_LIMIT:
+        n = visible_len(text)
+        log.info("Пост %d симв. > %d, прошу Gemini сократить", n, CAPTION_LIMIT)
+        prompt2 = (f"{prompt}\n\nТвой предыдущий вариант вышел слишком длинным ({n} симв.):\n{text}\n\n"
+                   f"Перепиши КОРОЧЕ: не более {CAPTION_TARGET} видимых символов. Сохрани заголовок, "
+                   f"локацию/сумму, суть схемы, квалификацию, панчлайн и подпись со ссылкой.")
+        try:
+            text2 = await generate_gemini_text(prompt2)
+            if visible_len(text2) < n:
+                text = text2
+        except Exception as e:
+            log.warning("Сокращение не удалось: %s", e)
+    return text
+
+
+# ======================= МЕДИА =======================
+
+def extract_media(items: list[types.Message]) -> list[dict]:
+    media = []
+    for m in sorted(items, key=lambda x: x.message_id):
+        if m.photo:
+            media.append({"type": "photo", "id": m.photo[-1].file_id})
+        elif m.video:
+            media.append({"type": "video", "id": m.video.file_id})
+        elif m.animation:
+            media.append({"type": "animation", "id": m.animation.file_id})
+    if len(media) > 1:  # гифки нельзя класть в альбом
+        media = [x for x in media if x["type"] != "animation"]
+    return media[:MAX_MEDIA]
+
+
+def media_label(media: list[dict]) -> str:
+    c = Counter(x["type"] for x in media)
+    names = {"photo": "фото", "video": "видео", "animation": "гиф"}
+    return ", ".join(f"{n} {names[t]}" for t, n in c.items()) or "без медиа"
+
+
+async def collect_group(message: types.Message) -> list[types.Message] | None:
+    """Для альбома возвращает все сообщения (только в первом вызове), для остальных частей None."""
+    gid = message.media_group_id
+    if not gid:
+        return [message]
+    key = (message.chat.id, gid)
+    buf = media_buffers.get(key)
+    if buf is not None:
+        buf.append(message)
+        return None
+    media_buffers[key] = [message]
+    await asyncio.sleep(MEDIA_GROUP_WAIT)
+    return sorted(media_buffers.pop(key), key=lambda m: m.message_id)
+
+
 # ======================= ОТПРАВКА ПОСТА =======================
 
-def get_preview_keyboard(has_photo: bool):
-    buttons = []
-    if has_photo:
-        buttons.append([InlineKeyboardButton(text="🚀 Опубликовать с фото", callback_data="publish_now")])
-    else:
-        buttons.append([InlineKeyboardButton(text="🚀 Опубликовать только текст", callback_data="publish_now")])
-        buttons.append([InlineKeyboardButton(text="🖼️ Добавить фото", callback_data="add_photo")])
-    buttons.append([InlineKeyboardButton(text="🔄 Перегенерировать", callback_data="regenerate")])
-    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+def get_preview_keyboard(has_media: bool):
+    rows = [
+        [InlineKeyboardButton(text="🚀 Опубликовать сейчас", callback_data="publish_now")],
+        [InlineKeyboardButton(text="⏰ Отложить", callback_data="schedule")],
+        [InlineKeyboardButton(text="🖼️ Заменить медиа" if has_media else "🖼️ Добавить фото/видео",
+                              callback_data="add_media")],
+        [InlineKeyboardButton(text="🔄 Перегенерировать", callback_data="regenerate")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def send_post(chat_id, text: str, photo_id: str | None = None,
-                    reply_markup=None, prefix: str = ""):
+def _input_media(media: list[dict], caption: str | None, mode: str | None):
+    items = []
+    for i, m in enumerate(media):
+        kw = {"media": m["id"]}
+        if i == 0 and caption:
+            kw["caption"] = caption
+            kw["parse_mode"] = mode
+        items.append(InputMediaPhoto(**kw) if m["type"] == "photo" else InputMediaVideo(**kw))
+    return items
+
+
+async def _send_media(chat_id, media: list[dict], caption: str | None = None,
+                      mode: str | None = None, reply_markup=None):
+    """Отправляет медиа (одно или альбом). Подпись только к первому элементу."""
+    if len(media) == 1:
+        m = media[0]
+        kw = dict(chat_id=chat_id, caption=caption, reply_markup=reply_markup)
+        if caption:
+            kw["parse_mode"] = mode
+        if m["type"] == "photo":
+            await bot.send_photo(photo=m["id"], **kw)
+        elif m["type"] == "video":
+            await bot.send_video(video=m["id"], **kw)
+        else:
+            await bot.send_animation(animation=m["id"], **kw)
+        return
+    await bot.send_media_group(chat_id=chat_id, media=_input_media(media, caption, mode))
+    if reply_markup:  # к альбому кнопки не прикрепить, шлём отдельным сообщением
+        await bot.send_message(chat_id=chat_id, text="👆 Превью поста. Что делаем?",
+                               reply_markup=reply_markup)
+
+
+async def send_post(chat_id, text: str, media: list[dict] | None = None, reply_markup=None):
     """
-    Отправка с учётом лимитов Telegram и запасными вариантами разметки:
-    1) полный HTML с премиум-эмодзи; 2) HTML без премиум-эмодзи; 3) чистый текст.
-    Подпись к фото <= 1024 символов, длиннее: фото и текст двумя сообщениями.
+    Медиа (фото/видео/альбом) + подпись одним постом, если текст влезает в 1024.
+    Если не влезает: медиа, затем текст отдельным сообщением.
+    Запасные варианты разметки: HTML с премиум-эмодзи -> HTML без них -> чистый текст.
+    Превью ссылок отключено (нет карточки канала).
     """
-    full = prefix + text
-    visible_len = len(html.unescape(strip_tags(full)))
-    long_mode = bool(photo_id) and visible_len > CAPTION_LIMIT
+    media = media or []
+    separate_text = bool(media) and visible_len(text) > CAPTION_LIMIT
 
-    if long_mode:
-        await bot.send_photo(chat_id=chat_id, photo=photo_id)
+    if separate_text:
+        await _send_media(chat_id, media)
 
-    variants = [(full, "HTML")]
-    no_emoji = drop_custom_emoji(full)
-    if no_emoji != full:
+    variants = [(text, "HTML")]
+    no_emoji = drop_custom_emoji(text)
+    if no_emoji != text:
         variants.append((no_emoji, "HTML"))
-    variants.append((html.unescape(strip_tags(full)), None))
+    variants.append((html.unescape(strip_tags(text)), None))
 
     last_error = None
     for body, mode in variants:
-        body = cut_to_limit(body)
         try:
-            if photo_id and not long_mode:
-                await bot.send_photo(chat_id=chat_id, photo=photo_id, caption=body,
-                                     parse_mode=mode, reply_markup=reply_markup)
+            if media and not separate_text:
+                await _send_media(chat_id, media, caption=body, mode=mode, reply_markup=reply_markup)
             else:
-                await bot.send_message(chat_id=chat_id, text=body,
-                                       parse_mode=mode, reply_markup=reply_markup)
+                await bot.send_message(chat_id=chat_id, text=cut_to_limit(body), parse_mode=mode,
+                                       reply_markup=reply_markup, link_preview_options=NO_PREVIEW)
             return
         except TelegramBadRequest as e:
             msg = str(e).lower()
@@ -525,6 +647,15 @@ async def send_post(chat_id, text: str, photo_id: str | None = None,
                 continue
             raise
     raise last_error
+
+
+async def show_preview(chat_id, post: str, media: list[dict]):
+    if media and visible_len(post) > CAPTION_LIMIT:
+        await bot.send_message(
+            chat_id,
+            f"⚠️ Текст ({visible_len(post)} симв.) длиннее лимита подписи Telegram ({CAPTION_LIMIT}). "
+            f"Он уйдёт отдельным сообщением после медиа. Чтобы был один пост, нажми «🔄 Перегенерировать».")
+    await send_post(chat_id, post, media, get_preview_keyboard(bool(media)))
 
 
 # ======================= СБОР ФАКТУРЫ (в т.ч. пересылки) =======================
@@ -547,7 +678,6 @@ def forward_source(message: types.Message) -> str | None:
 
 
 def extract_text(message: types.Message) -> str:
-    """Текст или подпись + скрытые ссылки (text_link), которых нет в самом тексте."""
     text = (message.text or message.caption or "").strip()
     entities = message.entities or message.caption_entities or []
     links = []
@@ -560,36 +690,215 @@ def extract_text(message: types.Message) -> str:
 
 
 async def handle_materials(first: types.Message, state: FSMContext, items: list[types.Message]):
-    texts, photo_id = [], None
-    for m in items:
+    texts = []
+    for m in sorted(items, key=lambda x: x.message_id):
         t = extract_text(m)
         if t and t not in texts:
             texts.append(t)
-        if photo_id is None and m.photo:
-            photo_id = m.photo[-1].file_id
+    media = extract_media(items)
 
     fact = "\n\n".join(texts).strip()
     source = forward_source(first)
 
     if not fact:
-        await first.answer("В сообщении нет текста. Пришли текст или фото с описанием (фактурой) в подписи.")
+        await first.answer("В сообщении нет текста. Пришли текст или фото/видео с описанием (фактурой) в подписи.")
         return
     if source:
         fact = f"Источник пересылки: {source}\n\n{fact}"
 
     msg = await first.answer("⏳ Gemini упаковывает пост в стиль Federal Insider...")
     try:
-        post = await generate_gemini_text(fact)
-        await state.update_data(post_text=post, photo_id=photo_id, original_input=fact)
+        post = await generate_post(fact, bool(media))
+        await state.update_data(post_text=post, media=media, original_input=fact)
         await state.set_state(PostState.preview)
         try:
             await msg.delete()
         except Exception:
             pass
-        await send_post(first.chat.id, post, photo_id, get_preview_keyboard(bool(photo_id)))
+        await show_preview(first.chat.id, post, media)
     except Exception as e:
         log.exception("Ошибка генерации")
         await first.answer(f"❌ Ошибка генерации: {e}")
+
+
+# ======================= ОТЛОЖЕННЫЕ ПОСТЫ =======================
+
+SCHEDULED: list[dict] = []
+WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+def save_schedule():
+    try:
+        d = os.path.dirname(SCHEDULE_FILE)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = SCHEDULE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(SCHEDULED, f, ensure_ascii=False)
+        os.replace(tmp, SCHEDULE_FILE)
+    except Exception as e:
+        log.error("Не удалось сохранить очередь: %s", e)
+
+
+def load_schedule():
+    try:
+        if os.path.exists(SCHEDULE_FILE):
+            with open(SCHEDULE_FILE, "r", encoding="utf-8") as f:
+                SCHEDULED[:] = json.load(f)
+        log.info("Отложенных постов в очереди: %d", len(SCHEDULED))
+    except Exception as e:
+        log.error("Не удалось прочитать очередь: %s", e)
+
+
+def fmt_dt(ts: float) -> str:
+    return datetime.fromtimestamp(ts, TZ).strftime("%d.%m.%Y %H:%M")
+
+
+def fmt_delta(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    parts = []
+    if d:
+        parts.append(f"{d} д.")
+    if h:
+        parts.append(f"{h} ч.")
+    if m or not parts:
+        parts.append(f"{m} мин.")
+    return " ".join(parts)
+
+
+def add_scheduled(chat_id: int, text: str, media: list[dict], dt: datetime) -> dict:
+    item = {"id": uuid.uuid4().hex[:8], "chat_id": chat_id, "text": text,
+            "media": media or [], "at": dt.timestamp(), "tries": 0}
+    SCHEDULED.append(item)
+    save_schedule()
+    return item
+
+
+def parse_user_datetime(raw: str) -> datetime | None:
+    """Форматы: 18:30 | 25.12 18:30 | 25.12.2026 18:30 | завтра 18:30 | сегодня 18:30 | послезавтра 18:30"""
+    s = raw.strip().lower()
+    m = re.fullmatch(
+        r"(?:(сегодня|завтра|послезавтра)\s+)?(?:(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?\s+)?"
+        r"(\d{1,2})[:.](\d{2})", s)
+    if not m:
+        return None
+    word, d, mo, y, hh, mm = m.groups()
+    hh, mm = int(hh), int(mm)
+    if hh > 23 or mm > 59:
+        return None
+    now = datetime.now(TZ)
+    try:
+        if word:
+            base = now.date() + timedelta(days={"сегодня": 0, "завтра": 1, "послезавтра": 2}[word])
+            dt = datetime(base.year, base.month, base.day, hh, mm, tzinfo=TZ)
+        elif d:
+            year = int(y) if y else now.year
+            if year < 100:
+                year += 2000
+            dt = datetime(year, int(mo), int(d), hh, mm, tzinfo=TZ)
+            if not y and dt < now:
+                dt = datetime(year + 1, int(mo), int(d), hh, mm, tzinfo=TZ)
+        else:
+            dt = datetime(now.year, now.month, now.day, hh, mm, tzinfo=TZ)
+            if dt <= now:
+                dt += timedelta(days=1)
+    except ValueError:
+        return None
+    return dt if dt > now + timedelta(seconds=10) else None
+
+
+def date_keyboard():
+    now = datetime.now(TZ)
+    rows, row = [], []
+    for i in range(8):
+        d = (now + timedelta(days=i)).date()
+        label = "Сегодня" if i == 0 else "Завтра" if i == 1 else WEEKDAYS[d.weekday()]
+        row.append(InlineKeyboardButton(text=f"{label} {d:%d.%m}", callback_data=f"sch:d:{d:%Y%m%d}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="⏱ Через 1 ч", callback_data="sch:in:60"),
+                 InlineKeyboardButton(text="⏱ Через 3 ч", callback_data="sch:in:180")])
+    rows.append([InlineKeyboardButton(text="✍️ Ввести вручную", callback_data="sch:manual")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="sch:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def hours_keyboard(d):
+    now = datetime.now(TZ)
+    start = now.hour if d == now.date() else 0
+    btns = [InlineKeyboardButton(text=f"{h:02d}", callback_data=f"sch:h:{d:%Y%m%d}:{h:02d}")
+            for h in range(start, 24)]
+    rows = [btns[i:i + 6] for i in range(0, len(btns), 6)]
+    rows.append([InlineKeyboardButton(text="◀️ К датам", callback_data="sch:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def minutes_keyboard(d, hour: int):
+    now = datetime.now(TZ)
+    mins = list(range(0, 60, 5))
+    if d == now.date() and hour == now.hour:
+        mins = [x for x in mins if x > now.minute]
+    btns = [InlineKeyboardButton(text=f"{hour:02d}:{x:02d}",
+                                 callback_data=f"sch:m:{d:%Y%m%d}:{hour:02d}:{x:02d}") for x in mins]
+    rows = [btns[i:i + 4] for i in range(0, len(btns), 4)]
+    rows.append([InlineKeyboardButton(text="◀️ К часам", callback_data=f"sch:d:{d:%Y%m%d}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows), bool(mins)
+
+
+async def notify(chat_id, text: str):
+    try:
+        await bot.send_message(chat_id, text, parse_mode="HTML", link_preview_options=NO_PREVIEW)
+    except Exception as e:
+        log.warning("Не удалось уведомить %s: %s", chat_id, e)
+
+
+def short_title(text: str, n: int = 90) -> str:
+    t = html.unescape(strip_tags(text)).replace("\n", " ").strip()
+    return html.escape(t[:n] + ("…" if len(t) > n else ""))
+
+
+async def publish_due():
+    now = time.time()
+    due = sorted([p for p in SCHEDULED if p["at"] <= now], key=lambda x: x["at"])
+    for p in due:
+        if p not in SCHEDULED:
+            continue
+        SCHEDULED.remove(p)  # сразу убираем, чтобы не отправить дважды
+        save_schedule()
+        try:
+            await send_post(CHANNEL_ID, p["text"], p.get("media"))
+            late = time.time() - p["at"]
+            note = f" (с опозданием {fmt_delta(late)})" if late > 120 else ""
+            log.info("Отложенный пост %s опубликован%s", p["id"], note)
+            await notify(p["chat_id"], f"✅ <b>Отложенный пост опубликован</b>{note}\n{short_title(p['text'])}")
+        except Exception as e:
+            log.exception("Ошибка публикации отложенного поста %s", p["id"])
+            p["tries"] = p.get("tries", 0) + 1
+            if p["tries"] < 3:
+                p["at"] = time.time() + 60
+                SCHEDULED.append(p)
+                save_schedule()
+                await notify(p["chat_id"], f"⚠️ Не вышло опубликовать отложенный пост ({html.escape(str(e)[:200])}). "
+                                           f"Повторю через минуту.")
+            else:
+                await notify(p["chat_id"], f"❌ Отложенный пост не опубликован после 3 попыток: "
+                                           f"{html.escape(str(e)[:200])}\n{short_title(p['text'])}")
+
+
+async def scheduler_loop():
+    log.info("Планировщик запущен")
+    while True:
+        try:
+            await publish_due()
+        except Exception:
+            log.exception("Ошибка в планировщике")
+        await asyncio.sleep(2)
 
 
 # ======================= ХЕНДЛЕРЫ =======================
@@ -604,13 +913,67 @@ async def start_cmd(message: types.Message, state: FSMContext):
     await state.clear()
     await state.set_state(PostState.waiting_for_input)
     await message.answer(
-        "👋 Привет! Закидывай фактуру: текст, ссылку, фото с описанием или просто "
-        "<b>перешли пост</b> из любого канала, и я упакую его под стиль <b>Federal Insider</b>.\n\n"
+        "👋 Привет! Закидывай фактуру: текст, ссылку, фото/видео с описанием или просто "
+        "<b>перешли пост</b> (в том числе альбом) из любого канала, и я упакую его под стиль "
+        "<b>Federal Insider</b>. Фото и видео сохранятся как есть, поменяется только текст.\n\n"
+        "/queue — отложенные посты\n"
         "/testgemini — проверить связь с Gemini\n"
         "/packs — перезагрузить наборы премиум-эмодзи\n"
         "/emojiid — узнать ID премиум-эмодзи",
         parse_mode="HTML",
     )
+
+
+@dp.message(Command("queue"))
+async def queue_cmd(message: types.Message):
+    if not SCHEDULED:
+        await message.answer("Очередь пуста. Отложить пост можно кнопкой «⏰ Отложить» в превью.")
+        return
+    for p in sorted(SCHEDULED, key=lambda x: x["at"]):
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="👁 Показать", callback_data=f"q:show:{p['id']}"),
+            InlineKeyboardButton(text="⚡ Сейчас", callback_data=f"q:now:{p['id']}"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"q:del:{p['id']}"),
+        ]])
+        await message.answer(
+            f"⏰ <b>{fmt_dt(p['at'])}</b> ({html.escape(TZ_NAME)}), через {fmt_delta(p['at'] - time.time())}\n"
+            f"📎 {media_label(p.get('media') or [])}\n{short_title(p['text'])}",
+            parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("q:"))
+async def queue_cb(callback: types.CallbackQuery):
+    _, act, pid = callback.data.split(":", 2)
+    item = next((p for p in SCHEDULED if p["id"] == pid), None)
+    if not item:
+        await callback.answer("Этот пост уже опубликован или удалён", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    if act == "show":
+        await callback.answer()
+        await send_post(callback.message.chat.id, item["text"], item.get("media"))
+    elif act == "del":
+        SCHEDULED.remove(item)
+        save_schedule()
+        await callback.answer("Удалено")
+        try:
+            await callback.message.edit_text("🗑 Отложенный пост удалён.")
+        except Exception:
+            pass
+    elif act == "now":
+        SCHEDULED.remove(item)
+        save_schedule()
+        await callback.answer("Публикую...")
+        try:
+            await send_post(CHANNEL_ID, item["text"], item.get("media"))
+            await callback.message.edit_text("✅ Опубликовано сразу.")
+        except Exception as e:
+            SCHEDULED.append(item)
+            save_schedule()
+            await callback.message.answer(f"❌ Ошибка публикации: {e}")
 
 
 @dp.message(Command("packs"))
@@ -622,7 +985,6 @@ async def packs_cmd(message: types.Message):
 
 @dp.message(Command("testgemini"))
 async def testgemini_cmd(message: types.Message):
-    # /testgemini  или  /testgemini gemini-3.5-flash,gemini-3.1-flash-lite
     parts = (message.text or "").split(maxsplit=1)
     models = [m.strip() for m in parts[1].split(",") if m.strip()] if len(parts) > 1 else list(GEMINI_MODELS)
     lines = [f"Цепочка моделей: <code>{html.escape(', '.join(GEMINI_MODELS))}</code>",
@@ -635,7 +997,6 @@ async def testgemini_cmd(message: types.Message):
         except Exception:
             pass
 
-    # 1) Доступность API и список моделей
     names: list[str] = []
     await show("⏳ Список моделей...")
     t0 = time.monotonic()
@@ -657,7 +1018,6 @@ async def testgemini_cmd(message: types.Message):
     except Exception as e:
         lines.append(f"❌ Список моделей: {html.escape(str(e)[:200])}")
 
-    # 2) Короткий запрос к каждой модели цепочки
     working = []
     for model in models:
         mark = " (нет в списке!)" if names and model not in names else ""
@@ -674,12 +1034,11 @@ async def testgemini_cmd(message: types.Message):
                 break
             except GeminiError as e:
                 lines.append(f"❌ {model} / {mode}: {html.escape(str(e)[:160])}")
-                if e.retry:  # перегрузка: второй способ на этой же модели не поможет
+                if e.retry:
                     break
             except Exception as e:
                 lines.append(f"❌ {model} / {mode}: {html.escape(str(e)[:160])}")
 
-    # 3) Боевой промпт на первой рабочей модели
     if working:
         model, mode, fn = working[0]
         await show(f"⏳ Боевой промпт: {model} / {mode}...")
@@ -711,7 +1070,6 @@ async def emojiid_receive(message: types.Message, state: FSMContext):
     lines = []
     for e in entities:
         if e.type == "custom_emoji":
-            # offset/length в Telegram считаются в UTF-16
             sym = raw[e.offset * 2:(e.offset + e.length) * 2].decode("utf-16-le")
             lines.append(f"{sym} → <code>{e.custom_emoji_id}</code>")
     await state.set_state(PostState.waiting_for_input)
@@ -722,62 +1080,149 @@ async def emojiid_receive(message: types.Message, state: FSMContext):
         await message.answer("Премиум-эмодзи в сообщении не найдено.")
 
 
-@dp.message(PostState.waiting_for_photo, F.photo)
-async def receive_photo(message: types.Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
+@dp.message(PostState.waiting_for_photo, F.photo | F.video | F.animation)
+async def receive_media(message: types.Message, state: FSMContext):
+    items = await collect_group(message)
+    if items is None:
+        return
+    media = extract_media(items)
+    if not media:
+        await message.answer("Не нашёл фото или видео. Пришли ещё раз.")
+        return
     data = await state.get_data()
-    await state.update_data(photo_id=photo_id)
+    await state.update_data(media=media)
     await state.set_state(PostState.preview)
-    await send_post(message.chat.id, data.get("post_text", ""), photo_id,
-                    get_preview_keyboard(True),
-                    prefix="✅ Фото прикреплено! Вот итоговый превью:\n\n")
+    await message.answer(f"✅ Медиа прикреплены: {media_label(media)}")
+    await show_preview(message.chat.id, data.get("post_text", ""), media)
 
 
 @dp.message(PostState.waiting_for_photo)
 async def waiting_photo_wrong_type(message: types.Message):
     if (message.text or "").startswith("/"):
         return
-    await message.answer("Нужно именно изображение. Пришли фото или нажми /start для сброса.")
+    await message.answer("Нужно фото, видео или альбом. Пришли медиа или нажми /start для сброса.")
+
+
+@dp.message(PostState.waiting_for_time, F.text)
+async def receive_time(message: types.Message, state: FSMContext):
+    if (message.text or "").startswith("/"):
+        return
+    dt = parse_user_datetime(message.text)
+    if not dt:
+        await message.answer(
+            "Не понял время или оно уже прошло. Форматы:\n"
+            "<code>18:30</code> — сегодня (или завтра, если уже прошло)\n"
+            "<code>25.12 18:30</code>\n<code>25.12.2026 18:30</code>\n"
+            "<code>завтра 09:00</code>\n\nИли /start для отмены.", parse_mode="HTML")
+        return
+    await finish_schedule(message.chat.id, message.chat.id, state, dt, message)
 
 
 @dp.message(StateFilter(None, PostState.waiting_for_input, PostState.preview))
 async def process_input(message: types.Message, state: FSMContext):
     if (message.text or "").startswith("/"):
         return
-
-    gid = message.media_group_id
-    if gid:
-        key = (message.chat.id, gid)
-        buf = media_buffers.get(key)
-        if buf is not None:
-            buf["items"].append(message)
-            return
-        media_buffers[key] = {"items": [message]}
-        await asyncio.sleep(MEDIA_GROUP_WAIT)  # ждём остальные части альбома
-        items = media_buffers.pop(key)["items"]
-        await handle_materials(message, state, items)
-    else:
-        await handle_materials(message, state, [message])
+    items = await collect_group(message)
+    if items is None:
+        return
+    await handle_materials(items[0], state, items)
 
 
-@dp.callback_query(PostState.preview, F.data == "add_photo")
-async def ask_for_photo(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(PostState.preview, F.data == "add_media")
+async def ask_for_media(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(PostState.waiting_for_photo)
-    await callback.message.answer("📸 Пришли изображение, которое нужно прикрепить к этому посту:")
+    await callback.message.answer("📸 Пришли фото, видео или альбом (до 10). "
+                                  "Они заменят текущие медиа, текст останется прежним:")
     await callback.answer()
+
+
+async def finish_schedule(chat_id: int, admin_chat: int, state: FSMContext, dt: datetime,
+                          reply_to: types.Message):
+    data = await state.get_data()
+    post_text, media = data.get("post_text"), data.get("media") or []
+    if not post_text:
+        await reply_to.answer("Нет текста для публикации. Пришли материал заново.")
+        return
+    item = add_scheduled(admin_chat, post_text, media, dt)
+    await state.clear()
+    await state.set_state(PostState.waiting_for_input)
+    await reply_to.answer(
+        f"⏰ <b>Пост запланирован</b>\n📅 {fmt_dt(item['at'])} ({html.escape(TZ_NAME)})\n"
+        f"⏳ через {fmt_delta(item['at'] - time.time())}\n\nСписок и удаление: /queue\n"
+        f"Жду новую фактуру.", parse_mode="HTML")
+
+
+@dp.callback_query(PostState.preview, F.data == "schedule")
+async def schedule_menu(callback: types.CallbackQuery):
+    await callback.answer()
+    now = datetime.now(TZ)
+    await callback.message.answer(
+        f"⏰ Когда опубликовать? Сейчас {now:%d.%m %H:%M} ({html.escape(TZ_NAME)}). Выбери дату:",
+        reply_markup=date_keyboard())
+
+
+@dp.callback_query(PostState.preview, F.data.startswith("sch:"))
+async def schedule_cb(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    act = parts[1]
+    now = datetime.now(TZ)
+    try:
+        if act == "back":
+            await callback.message.delete()
+            await callback.answer()
+        elif act == "menu":
+            await callback.message.edit_text("Выбери дату:", reply_markup=date_keyboard())
+            await callback.answer()
+        elif act == "d":
+            d = datetime.strptime(parts[2], "%Y%m%d").date()
+            await callback.message.edit_text(f"📅 {d:%d.%m.%Y}. Выбери час:", reply_markup=hours_keyboard(d))
+            await callback.answer()
+        elif act == "h":
+            d = datetime.strptime(parts[2], "%Y%m%d").date()
+            kb, ok = minutes_keyboard(d, int(parts[3]))
+            if not ok:
+                await callback.answer("Этот час уже заканчивается, выбери следующий", show_alert=True)
+                return
+            await callback.message.edit_text(f"📅 {d:%d.%m.%Y}, {int(parts[3]):02d}:__. Выбери минуты:",
+                                             reply_markup=kb)
+            await callback.answer()
+        elif act == "m":
+            dt = datetime.strptime(parts[2] + parts[3] + parts[4], "%Y%m%d%H%M").replace(tzinfo=TZ)
+            if dt <= now + timedelta(seconds=10):
+                await callback.answer("Это время уже прошло", show_alert=True)
+                return
+            await callback.answer()
+            await finish_schedule(callback.message.chat.id, callback.message.chat.id, state, dt, callback.message)
+        elif act == "in":
+            dt = now + timedelta(minutes=int(parts[2]))
+            await callback.answer()
+            await finish_schedule(callback.message.chat.id, callback.message.chat.id, state, dt, callback.message)
+        elif act == "manual":
+            await state.set_state(PostState.waiting_for_time)
+            await callback.message.edit_text(
+                f"✍️ Напиши дату и время ({html.escape(TZ_NAME)}):\n"
+                "<code>18:30</code> — сегодня (или завтра, если уже прошло)\n"
+                "<code>25.12 18:30</code>\n<code>25.12.2026 18:30</code>\n<code>завтра 09:00</code>\n\n"
+                "/start — отмена", parse_mode="HTML")
+            await callback.answer()
+        else:
+            await callback.answer()
+    except TelegramBadRequest as e:
+        log.warning("schedule_cb: %s", e)
+        await callback.answer()
 
 
 @dp.callback_query(PostState.preview, F.data == "publish_now")
 async def publish_now(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    post_text, photo_id = data.get("post_text"), data.get("photo_id")
+    post_text, media = data.get("post_text"), data.get("media") or []
     if not post_text:
         await callback.answer("Нет текста для публикации", show_alert=True)
         return
 
     await state.set_state(PostState.waiting_for_input)  # защита от двойного клика
     try:
-        await send_post(CHANNEL_ID, post_text, photo_id)
+        await send_post(CHANNEL_ID, post_text, media)
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -795,17 +1240,17 @@ async def publish_now(callback: types.CallbackQuery, state: FSMContext):
 async def regenerate(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     data = await state.get_data()
-    original, photo_id = data.get("original_input", ""), data.get("photo_id")
+    original, media = data.get("original_input", ""), data.get("media") or []
     msg = await callback.message.answer("🔄 Перегенерирую пост...")
     try:
-        post = await generate_gemini_text(original)
+        post = await generate_post(original, bool(media))
         await state.update_data(post_text=post)
         await state.set_state(PostState.preview)
         try:
             await msg.delete()
         except Exception:
             pass
-        await send_post(callback.message.chat.id, post, photo_id, get_preview_keyboard(bool(photo_id)))
+        await show_preview(callback.message.chat.id, post, media)
     except Exception as e:
         log.exception("Ошибка перегенерации")
         await callback.message.answer(f"❌ Ошибка генерации: {e}")
@@ -819,7 +1264,7 @@ async def cancel(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.callback_query(F.data.in_({"publish_now", "regenerate", "add_photo"}))
+@dp.callback_query(F.data.in_({"publish_now", "regenerate", "add_media", "schedule"}) | F.data.startswith("sch:"))
 async def stale_callback(callback: types.CallbackQuery):
     await callback.answer("Сессия устарела. Пришли материал заново.", show_alert=True)
 
@@ -831,7 +1276,6 @@ async def handle_ping(request):
 
 
 async def keep_alive():
-    """Render Free засыпает без входящего трафика, поэтому пингуем свой же URL."""
     url = os.getenv("RENDER_EXTERNAL_URL")
     if not url:
         return
@@ -846,7 +1290,6 @@ async def keep_alive():
 
 
 async def main():
-    # Веб-сервер поднимаем первым, чтобы Render сразу видел открытый порт
     app = web.Application()
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
@@ -856,9 +1299,9 @@ async def main():
     log.info("Веб-сервер запущен на порту %s", os.getenv("PORT", 10000))
 
     log.info("Настройки: модель=%s, режим=%s, thinking=%s, таймаут=%s, админов=%d, "
-             "GEMINI_API_KEY=%s, CHANNEL_ID=%s",
+             "GEMINI_API_KEY=%s, CHANNEL_ID=%s, TZ=%s, очередь=%s",
              GEMINI_MODEL, GEMINI_API_MODE, THINKING_LEVEL, GEMINI_TIMEOUT, len(ADMIN_IDS),
-             "есть" if GEMINI_API_KEY else "НЕ ЗАДАН", CHANNEL_ID or "НЕ ЗАДАН")
+             "есть" if GEMINI_API_KEY else "НЕ ЗАДАН", CHANNEL_ID or "НЕ ЗАДАН", TZ_NAME, SCHEDULE_FILE)
     if not ADMIN_IDS:
         log.warning("ADMIN_IDS пуст: бот закрыт для всех. Свой ID можно узнать командой /id")
 
@@ -867,20 +1310,23 @@ async def main():
         log.info("Бот авторизован: @%s (id %s)", me.username, me.id)
     except Exception as e:
         log.error("Не удалось авторизоваться в Telegram, проверь TELEGRAM_BOT_TOKEN: %s", e)
-        await asyncio.Event().wait()  # не падаем, чтобы ошибка осталась в логах
+        await asyncio.Event().wait()
 
     try:
         await load_premium_packs()
     except Exception as e:
         log.warning("Наборы эмодзи не загружены: %s", e)
 
+    load_schedule()
     keep_task = asyncio.create_task(keep_alive())
+    sched_task = asyncio.create_task(scheduler_loop())
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         log.info("Polling запущен, жду сообщения")
         await dp.start_polling(bot)
     finally:
         keep_task.cancel()
+        sched_task.cancel()
         if _http_session and not _http_session.closed:
             await _http_session.close()
         await runner.cleanup()
