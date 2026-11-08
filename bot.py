@@ -100,7 +100,7 @@ async def process_input(message: types.Message, state: FSMContext):
 
     try:
         response = ai_client.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash',
             contents=f"{SYSTEM_PROMPT}\n\nИсходные данные:\n{user_text}"
         )
         generated_post = response.text
@@ -167,7 +167,7 @@ async def regenerate(callback: types.CallbackQuery, state: FSMContext):
     
     try:
         response = ai_client.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash',
             contents=f"{SYSTEM_PROMPT}\n\nИсходные данные:\n{original_input}"
         )
         generated_post = response.text
