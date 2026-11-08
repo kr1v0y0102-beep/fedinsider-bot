@@ -99,8 +99,9 @@ async def process_input(message: types.Message, state: FSMContext):
     msg = await message.answer("⏳ Gemini упаковывает пост в стиль Federal Insider...")
 
     try:
-        response = ai_client.models.generate_content(
-            model='gemini-3.8-flash',
+        # Вызов через асинхронный клиент библиотеки google-genai
+        response = await ai_client.aio.models.generate_content(
+            model='gemini-2.5-flash',
             contents=f"{SYSTEM_PROMPT}\n\nИсходные данные:\n{user_text}"
         )
         generated_post = response.text
@@ -166,8 +167,8 @@ async def regenerate(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("🔄 Перегенерирую пост...")
     
     try:
-        response = ai_client.models.generate_content(
-            model='gemini-3.8-flash',
+        response = await ai_client.aio.models.generate_content(
+            model='gemini-2.5-flash',
             contents=f"{SYSTEM_PROMPT}\n\nИсходные данные:\n{original_input}"
         )
         generated_post = response.text
