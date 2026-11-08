@@ -77,6 +77,13 @@ def get_preview_keyboard(has_photo: bool):
     buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+def call_gemini(text: str):
+    response = ai_client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=f"{SYSTEM_PROMPT}\n\nИсходные данные:\n{text}"
+    )
+    return response.text
+
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
     await state.set_state(PostState.waiting_for_input)
@@ -99,12 +106,8 @@ async def process_input(message: types.Message, state: FSMContext):
     msg = await message.answer("⏳ Gemini упаковывает пост в стиль Federal Insider...")
 
     try:
-        # Вызов через асинхронный клиент библиотеки google-genai
-        response = await ai_client.aio.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=f"{SYSTEM_PROMPT}\n\nИсходные данные:\n{user_text}"
-        )
-        generated_post = response.text
+        # Вызов в отдельном потоке, чтобы не вешать бота
+        generated_post = await asyncio.to_thread(call_gemini, user_text)
 
         await state.update_data(post_text=generated_post, photo_id=photo_id, original_input=user_text)
         await state.set_state(PostState.preview)
@@ -167,11 +170,7 @@ async def regenerate(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("🔄 Перегенерирую пост...")
     
     try:
-        response = await ai_client.aio.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=f"{SYSTEM_PROMPT}\n\nИсходные данные:\n{original_input}"
-        )
-        generated_post = response.text
+        generated_post = await asyncio.to_thread(call_gemini, original_input)
 
         await state.update_data(post_text=generated_post)
         await state.set_state(PostState.preview)
