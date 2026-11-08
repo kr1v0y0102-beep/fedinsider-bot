@@ -185,4 +185,34 @@ async def regenerate(callback: types.CallbackQuery, state: FSMContext):
         await state.set_state(PostState.preview)
 
         if photo_id:
-            await callback.message.answer_photo(photo=photo_id, caption=generated_post, parse_mode="HTML", reply_markup=get_
+            await callback.message.answer_photo(photo=photo_id, caption=generated_post, parse_mode="HTML", reply_markup=get_preview_keyboard(True))
+        else:
+            await callback.message.answer(text=generated_post, parse_mode="HTML", reply_markup=get_preview_keyboard(False))
+    except Exception as e:
+        await callback.message.answer(f"❌ Ошибка генерации: {e}")
+        
+    await callback.answer()
+
+@dp.callback_query(F.data == "cancel")
+async def cancel(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(PostState.waiting_for_input)
+    await callback.message.answer("Отменено. Жду новую фактуру.")
+    await callback.answer()
+
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
+
+async def main():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
