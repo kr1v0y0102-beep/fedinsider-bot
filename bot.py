@@ -1,11 +1,11 @@
 import os
 import asyncio
+import aiohttp
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from google import genai
 from aiohttp import web
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -14,7 +14,6 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 processed_media_groups = set()
 
@@ -77,12 +76,23 @@ def get_preview_keyboard(has_photo: bool):
     buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def call_gemini(text: str):
-    response = ai_client.models.generate_content(
-        model='gemini-2.5-flash',
-        contents=f"{SYSTEM_PROMPT}\n\nИсходные данные:\n{text}"
-    )
-    return response.text
+async def generate_gemini_text(prompt_text: str) -> str:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": f"{SYSTEM_PROMPT}\n\nИсходные данные:\n{prompt_text}"}
+                ]
+            }
+        ]
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                raise Exception(f"API Error {resp.status}: {data}")
+            return data["candidates"][0]["content"]["parts"][0]["text"]
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
@@ -106,8 +116,7 @@ async def process_input(message: types.Message, state: FSMContext):
     msg = await message.answer("⏳ Gemini упаковывает пост в стиль Federal Insider...")
 
     try:
-        # Вызов в отдельном потоке, чтобы не вешать бота
-        generated_post = await asyncio.to_thread(call_gemini, user_text)
+        generated_post = await generate_gemini_text(user_text)
 
         await state.update_data(post_text=generated_post, photo_id=photo_id, original_input=user_text)
         await state.set_state(PostState.preview)
@@ -170,40 +179,10 @@ async def regenerate(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("🔄 Перегенерирую пост...")
     
     try:
-        generated_post = await asyncio.to_thread(call_gemini, original_input)
+        generated_post = await generate_gemini_text(original_input)
 
         await state.update_data(post_text=generated_post)
         await state.set_state(PostState.preview)
 
         if photo_id:
-            await callback.message.answer_photo(photo=photo_id, caption=generated_post, parse_mode="HTML", reply_markup=get_preview_keyboard(True))
-        else:
-            await callback.message.answer(text=generated_post, parse_mode="HTML", reply_markup=get_preview_keyboard(False))
-    except Exception as e:
-        await callback.message.answer(f"❌ Ошибка генерации: {e}")
-        
-    await callback.answer()
-
-@dp.callback_query(F.data == "cancel")
-async def cancel(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await state.set_state(PostState.waiting_for_input)
-    await callback.message.answer("Отменено. Жду новую фактуру.")
-    await callback.answer()
-
-async def handle_ping(request):
-    return web.Response(text="Bot is running!")
-
-async def main():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            await callback.message.answer_photo(photo=photo_id, caption=generated_post, parse_mode="HTML", reply_markup=get_
