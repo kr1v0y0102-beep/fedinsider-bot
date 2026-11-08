@@ -6,8 +6,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from google import genai
+from aiohttp import web
 
-# Переменные окружения подтягиваются автоматически из Render
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
@@ -16,11 +16,13 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
+processed_media_groups = set()
+
 class PostState(StatesGroup):
     waiting_for_input = State()
+    waiting_for_photo = State()
     preview = State()
 
-# Системный промпт с максимальной юридической защитой и полным словарем
 SYSTEM_PROMPT = """
 Ты — главный редактор и автор Telegram-канала «Federal Insider». 
 Твоя задача — переписывать входящую фактуру, материалы сливов и новости в фирменный пост канала.
@@ -63,6 +65,18 @@ SYSTEM_PROMPT = """
 Выдавай ТОЛЬКО готовый текст поста без вступлений, приветствий и пояснений.
 """
 
+def get_preview_keyboard(has_photo: bool):
+    buttons = []
+    if has_photo:
+        buttons.append([InlineKeyboardButton(text="🚀 Опубликовать с фото", callback_data="publish_now")])
+    else:
+        buttons.append([InlineKeyboardButton(text="🚀 Опубликовать только текст", callback_data="publish_now")])
+        buttons.append([InlineKeyboardButton(text="🖼️ Добавить фото", callback_data="add_photo")])
+    
+    buttons.append([InlineKeyboardButton(text="🔄 Перегенерировать", callback_data="regenerate")])
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
     await state.set_state(PostState.waiting_for_input)
@@ -70,6 +84,11 @@ async def start_cmd(message: types.Message, state: FSMContext):
 
 @dp.message(PostState.waiting_for_input)
 async def process_input(message: types.Message, state: FSMContext):
+    if message.media_group_id:
+        if message.media_group_id in processed_media_groups:
+            return
+        processed_media_groups.add(message.media_group_id)
+
     user_text = message.caption or message.text or ""
     photo_id = message.photo[-1].file_id if message.photo else None
 
@@ -81,28 +100,44 @@ async def process_input(message: types.Message, state: FSMContext):
 
     try:
         response = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash',
             contents=f"{SYSTEM_PROMPT}\n\nИсходные данные:\n{user_text}"
         )
         generated_post = response.text
 
-        await state.update_data(post_text=generated_post, photo_id=photo_id)
+        await state.update_data(post_text=generated_post, photo_id=photo_id, original_input=user_text)
         await state.set_state(PostState.preview)
-
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🚀 Опубликовать сейчас", callback_data="publish_now")],
-            [InlineKeyboardButton(text="🔄 Перегенерировать", callback_data="regenerate")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]
-        ])
 
         await msg.delete()
         if photo_id:
-            await message.answer_photo(photo=photo_id, caption=generated_post, parse_mode="HTML", reply_markup=kb)
+            await message.answer_photo(photo=photo_id, caption=generated_post, parse_mode="HTML", reply_markup=get_preview_keyboard(True))
         else:
-            await message.answer(text=generated_post, parse_mode="HTML", reply_markup=kb)
+            await message.answer(text=generated_post, parse_mode="HTML", reply_markup=get_preview_keyboard(False))
 
     except Exception as e:
         await message.answer(f"❌ Ошибка генерации: {e}")
+
+@dp.callback_query(PostState.preview, F.data == "add_photo")
+async def ask_for_photo(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(PostState.waiting_for_photo)
+    await callback.message.answer("📸 Пришли изображение, которое нужно прикрепить к этому посту:")
+    await callback.answer()
+
+@dp.message(PostState.waiting_for_photo, F.photo)
+async def receive_photo(message: types.Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id
+    data = await state.get_data()
+    post_text = data.get("post_text")
+
+    await state.update_data(photo_id=photo_id)
+    await state.set_state(PostState.preview)
+
+    await message.answer_photo(
+        photo=photo_id, 
+        caption=f"✅ Фото прикреплено! Вот итоговый превью:\n\n{post_text}", 
+        parse_mode="HTML", 
+        reply_markup=get_preview_keyboard(True)
+    )
 
 @dp.callback_query(F.data == "publish_now")
 async def publish_now(callback: types.CallbackQuery, state: FSMContext):
@@ -124,17 +159,50 @@ async def publish_now(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "regenerate")
 async def regenerate(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    original_input = data.get("original_input", "")
+    photo_id = data.get("photo_id")
+    
     await callback.message.answer("🔄 Перегенерирую пост...")
-    await state.set_state(PostState.waiting_for_input)
+    
+    try:
+        response = ai_client.models.generate_content(
+            model='gemini-2.0-flash',
+            contents=f"{SYSTEM_PROMPT}\n\nИсходные данные:\n{original_input}"
+        )
+        generated_post = response.text
+
+        await state.update_data(post_text=generated_post)
+        await state.set_state(PostState.preview)
+
+        if photo_id:
+            await callback.message.answer_photo(photo=photo_id, caption=generated_post, parse_mode="HTML", reply_markup=get_preview_keyboard(True))
+        else:
+            await callback.message.answer(text=generated_post, parse_mode="HTML", reply_markup=get_preview_keyboard(False))
+    except Exception as e:
+        await callback.message.answer(f"❌ Ошибка генерации: {e}")
+        
     await callback.answer()
 
 @dp.callback_query(F.data == "cancel")
 async def cancel(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
+    await state.set_state(PostState.waiting_for_input)
     await callback.message.answer("Отменено. Жду новую фактуру.")
     await callback.answer()
 
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
+
 async def main():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
