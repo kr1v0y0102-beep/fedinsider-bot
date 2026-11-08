@@ -77,7 +77,8 @@ def get_preview_keyboard(has_photo: bool):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def generate_gemini_text(prompt_text: str) -> str:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    # Использование официального API v1 с актуальной моделью gemini-2.5-flash
+    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [
             {
@@ -91,7 +92,13 @@ async def generate_gemini_text(prompt_text: str) -> str:
         async with session.post(url, json=payload) as resp:
             data = await resp.json()
             if resp.status != 200:
-                raise Exception(f"API Error {resp.status}: {data}")
+                # Пробуем резервный эндпоинт v1beta с gemini-2.5-flash если v1 вернет ошибку
+                fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+                async with session.post(fallback_url, json=payload) as fb_resp:
+                    fb_data = await fb_resp.json()
+                    if fb_resp.status != 200:
+                        raise Exception(f"API Error {fb_resp.status}: {fb_data}")
+                    return fb_data["candidates"][0]["content"]["parts"][0]["text"]
             return data["candidates"][0]["content"]["parts"][0]["text"]
 
 @dp.message(Command("start"))
