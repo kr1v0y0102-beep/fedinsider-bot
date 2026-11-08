@@ -18,11 +18,11 @@ log = logging.getLogger("federal-insider")
 
 # ======================= НАСТРОЙКИ (переменные окружения) =======================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/federal_inside")
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/federal_inside").strip()
 # low / minimal ускоряют ответ. Пустое значение или "off" отключает параметр.
 THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low").strip().lower()
 if THINKING_LEVEL in ("", "off", "none"):
@@ -33,7 +33,7 @@ GEMINI_RETRIES = int(os.getenv("GEMINI_RETRIES", "2"))
 
 def parse_admin_ids(raw: str) -> set[int]:
     ids = set()
-    for part in re.split(r"[,\s;]+", raw or ""):
+    for part in re.split(r"[,\s;]+", (raw or "").replace('"', "").replace("'", "")):
         part = part.strip()
         if part.lstrip("-").isdigit():
             ids.add(int(part))
@@ -44,11 +44,11 @@ def parse_admin_ids(raw: str) -> set[int]:
 ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 
 # Премиум-эмодзи канала: {"обычный эмодзи": "custom_emoji_id"}.
-# Свои ID можно добавить через переменную PREMIUM_EMOJI_JSON, например:
+# Свои ID добавляются через переменную PREMIUM_EMOJI_JSON, например:
 # {"📍":"5368...","💰":"5369...","⚖️":"5370..."}
 PREMIUM_EMOJI: dict[str, str] = {"📌": "5368324170671202286"}
 try:
-    PREMIUM_EMOJI.update({k: str(v) for k, v in json.loads(os.getenv("PREMIUM_EMOJI_JSON", "{}")).items()})
+    PREMIUM_EMOJI.update({k: str(v) for k, v in json.loads(os.getenv("PREMIUM_EMOJI_JSON", "{}") or "{}").items()})
 except Exception as e:
     log.warning("PREMIUM_EMOJI_JSON не разобран: %s", e)
 
@@ -56,6 +56,9 @@ CAPTION_LIMIT = 1024
 MESSAGE_LIMIT = 4096
 MEDIA_GROUP_WAIT = 1.5
 MAX_INPUT_CHARS = 12000
+
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("Не задана переменная окружения TELEGRAM_BOT_TOKEN")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
@@ -142,12 +145,19 @@ def build_system_prompt() -> str:
 SYSTEM_PROMPT = build_system_prompt()
 
 
-# ======================= ДОСТУП ТОЛЬКО ДЛЯ АДМИНОВ =======================
+# ======================= MIDDLEWARE: ЛОГИ И ДОСТУП =======================
+
+async def log_updates(handler, event, data):
+    user = getattr(event, "from_user", None)
+    log.info("Апдейт %s от %s: %s", type(event).__name__, getattr(user, "id", None),
+             (getattr(event, "text", None) or getattr(event, "data", None) or "")[:60])
+    return await handler(event, data)
+
 
 async def admin_only(handler, event, data):
     user = getattr(event, "from_user", None)
     # /id доступна всем, чтобы можно было узнать свой Telegram ID
-    if isinstance(event, types.Message) and (event.text or "").startswith("/id"):
+    if isinstance(event, types.Message) and (event.text or "").split("@")[0].strip() == "/id":
         return await handler(event, data)
     if user is None or user.id not in ADMIN_IDS:
         log.info("Отказано в доступе: %s", getattr(user, "id", None))
@@ -159,8 +169,16 @@ async def admin_only(handler, event, data):
     return await handler(event, data)
 
 
+# log_updates регистрируется первым, чтобы видеть и отклонённые сообщения
+dp.message.outer_middleware(log_updates)
+dp.callback_query.outer_middleware(log_updates)
 dp.message.outer_middleware(admin_only)
 dp.callback_query.outer_middleware(admin_only)
+
+
+@dp.errors()
+async def on_error(event: types.ErrorEvent):
+    log.exception("Необработанная ошибка в хендлере: %s", event.exception)
 
 
 # ======================= ОБРАБОТКА HTML И ЭМОДЗИ =======================
@@ -191,7 +209,6 @@ def sanitize_html(text: str) -> str:
             m = TAG_NAME_RE.match(token)
             if m and m.group(1).lower() in ALLOWED_TAGS:
                 out.append(token)
-            # неизвестные теги отбрасываем
         else:
             token = BARE_AMP_RE.sub("&amp;", token).replace("<", "&lt;").replace(">", "&gt;")
             out.append(token)
@@ -207,7 +224,6 @@ def fix_premium_emoji(text: str) -> str:
     for idx, part in enumerate(parts):
         if part.startswith("<tg-emoji"):
             continue
-        # не трогаем содержимое тегов (атрибуты)
         sub = TAG_RE.split(part)
         for j, seg in enumerate(sub):
             if seg.startswith("<") and seg.endswith(">"):
@@ -251,6 +267,9 @@ async def get_session() -> aiohttp.ClientSession:
 
 
 async def generate_gemini_text(prompt_text: str) -> str:
+    if not GEMINI_API_KEY:
+        raise Exception("Не задана переменная окружения GEMINI_API_KEY")
+
     url = "https://generativelanguage.googleapis.com/v1beta/interactions"
     headers = {
         "x-goog-api-key": GEMINI_API_KEY,
@@ -338,7 +357,7 @@ async def send_post(chat_id, text: str, photo_id: str | None = None,
     """
     Отправка с учётом лимитов Telegram и запасными вариантами разметки:
     1) полный HTML с премиум-эмодзи; 2) HTML без премиум-эмодзи; 3) чистый текст.
-    Подпись к фото ≤ 1024 символов, длиннее — фото и текст двумя сообщениями.
+    Подпись к фото <= 1024 символов, длиннее: фото и текст двумя сообщениями.
     """
     full = prefix + text
     visible_len = len(html.unescape(strip_tags(full)))
@@ -467,17 +486,16 @@ async def emojiid_cmd(message: types.Message, state: FSMContext):
 @dp.message(PostState.waiting_for_emoji)
 async def emojiid_receive(message: types.Message, state: FSMContext):
     entities = (message.entities or []) + (message.caption_entities or [])
-    ids = [e.custom_emoji_id for e in entities if e.type == "custom_emoji"]
     text = message.text or message.caption or ""
+    raw = text.encode("utf-16-le")
     lines = []
     for e in entities:
         if e.type == "custom_emoji":
-            # entity.offset/length считаются в UTF-16, поэтому берём срез через него
-            raw = text.encode("utf-16-le")
+            # offset/length в Telegram считаются в UTF-16
             sym = raw[e.offset * 2:(e.offset + e.length) * 2].decode("utf-16-le")
             lines.append(f"{sym} → <code>{e.custom_emoji_id}</code>")
     await state.set_state(PostState.waiting_for_input)
-    if ids:
+    if lines:
         await message.answer("\n".join(lines) + "\n\nДобавь их в переменную PREMIUM_EMOJI_JSON.",
                              parse_mode="HTML")
     else:
@@ -608,23 +626,33 @@ async def keep_alive():
 
 
 async def main():
-    if not all([TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, CHANNEL_ID]):
-        raise RuntimeError("Задай TELEGRAM_BOT_TOKEN, GEMINI_API_KEY и CHANNEL_ID")
-    if not ADMIN_IDS:
-        log.warning("ADMIN_IDS пуст: бот закрыт для всех. Свой ID можно узнать командой /id")
-
+    # Веб-сервер поднимаем первым, чтобы Render сразу видел открытый порт
     app = web.Application()
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000)))
     await site.start()
+    log.info("Веб-сервер запущен на порту %s", os.getenv("PORT", 10000))
+
+    log.info("Настройки: модель=%s, thinking=%s, админов=%d, GEMINI_API_KEY=%s, CHANNEL_ID=%s",
+             GEMINI_MODEL, THINKING_LEVEL, len(ADMIN_IDS),
+             "есть" if GEMINI_API_KEY else "НЕ ЗАДАН",
+             CHANNEL_ID or "НЕ ЗАДАН")
+    if not ADMIN_IDS:
+        log.warning("ADMIN_IDS пуст: бот закрыт для всех. Свой ID можно узнать командой /id")
+
+    try:
+        me = await bot.get_me()
+        log.info("Бот авторизован: @%s (id %s)", me.username, me.id)
+    except Exception as e:
+        log.error("Не удалось авторизоваться в Telegram, проверь TELEGRAM_BOT_TOKEN: %s", e)
+        await asyncio.Event().wait()  # не падаем, чтобы ошибка осталась в логах
 
     keep_task = asyncio.create_task(keep_alive())
-    log.info("Старт бота. Модель: %s, thinking: %s, админов: %d",
-             GEMINI_MODEL, THINKING_LEVEL, len(ADMIN_IDS))
     try:
         await bot.delete_webhook(drop_pending_updates=True)
+        log.info("Polling запущен, жду сообщения")
         await dp.start_polling(bot)
     finally:
         keep_task.cancel()
